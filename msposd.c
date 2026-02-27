@@ -48,6 +48,7 @@ bool ParseMSP = true;
 bool DrawOSD = false;
 bool mspVTXenabled = false;
 bool vtxMenuEnabled = false;
+int MsposdFastShutdown = 0;
 extern char* recording_dir;
 
 // libevent base main loop
@@ -185,6 +186,7 @@ static void signal_cb(evutil_socket_t fd, short event, void *arg) {
 	struct event_base *base = arg;
 	(void)event;
 	AbortNow = true;
+	MsposdFastShutdown = 1;
 	printf("Exit Request: %s signal received\n", strsignal(fd));
 	event_base_loopbreak(base);
 }
@@ -1095,6 +1097,7 @@ static int handle_data(const char *port_name, int baudrate, const char *out_addr
 	struct event *sig_int = NULL, *in_ev = NULL, *temp_tmr = NULL, *msp_tmr = NULL;
 	struct event *sig_term;
 	int ret = EXIT_SUCCESS;
+	MsposdFastShutdown = 0;
 
 	// Read from UDP
 	if (strlen(port_name) > 0 && port_name[0] >= '0' && port_name[0] <= '9') {
@@ -1281,6 +1284,10 @@ static int handle_data(const char *port_name, int baudrate, const char *out_addr
 	event_base_dispatch(base);
 
 err:
+	// Signal-triggered stop: avoid driver teardown paths that can deadlock.
+	if (MsposdFastShutdown)
+		return ret;
+
 	if (temp_tmr) {
 		event_del(temp_tmr);
 		event_free(temp_tmr);
