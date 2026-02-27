@@ -210,6 +210,7 @@ int RCWidgetY = 0;
 char air_unit_info_msg[MAX_STATUS_MSG_LEN];
 
 extern bool AbortNow;
+extern int MsposdFastShutdown;
 extern bool verbose;
 extern struct sockaddr_in sin_out; //= {.sin_family = AF_INET,};
 extern int out_sock;
@@ -2637,28 +2638,47 @@ static void CloseMSP() {
 #ifdef __SIGMASTAR__
 	// s32Ret = MI_RGN_Destroy(&osds[FULL_OVERLAY_ID].hand);
 	if (DrawOSD){
-		s32Ret = unload_region(&osds[FULL_OVERLAY_ID].hand);
+		if (MsposdFastShutdown) {
+			printf("Fast signal shutdown requested, skipping SigmaStar RGN deinit path.\n");
+		} else {
+			s32Ret = unload_region(&osds[FULL_OVERLAY_ID].hand);
 
-		deinit = MI_RGN_DeInit(DEV2);
-		if (deinit)
-			printf("[%s:%d]RGN_DeInit failed with %#x!\n", __func__, __LINE__, s32Ret);
+			deinit = MI_RGN_DeInit(DEV2);
+			if (deinit)
+				printf("[%s:%d]RGN_DeInit failed with %#x!\n", __func__, __LINE__, s32Ret);
+		}
 	}
 #endif
 #if defined(_x86) || defined(__ROCKCHIP__)
 	Close();
-#endif	
+#endif
 
-	if (bitmapFnt.pData != NULL)
+	subtitle_cleanup();
+
+	if (bitmapFnt.pData != NULL) {
 		free(bitmapFnt.pData);
-	if (bmpBuff.pData != NULL && !useDirectBMPBuffer)
+		bitmapFnt.pData = NULL;
+	}
+	if (bmpBuff.pData != NULL && !useDirectBMPBuffer) {
 		free(bmpBuff.pData);
-	if (bmpFntSmall.pData != NULL)
+	}
+	bmpBuff.pData = NULL;
+	if (bmpFntSmall.pData != NULL) {
 		free(bmpFntSmall.pData);
-	
-	printf("TrueType Font released: %d\n",FreeCachedFont(sft.font) );
- 
+		bmpFntSmall.pData = NULL;
+	}
+
+	if (display_driver != NULL) {
+		free(display_driver);
+		display_driver = NULL;
+	}
+
+	printf("TrueType Font released: %d\n", FreeCachedFont(sft.font));
+
 	//int res_mun = munmap(osds, sizeof(*osds) * MAX_OSD);
-	if (osds!=NULL)
+	if (osds != NULL) {
 		free(osds);
+		osds = NULL;
+	}
 	printf("RGN_Destroy: %X, RGN_DeInit: %X\n", s32Ret, deinit);
 }

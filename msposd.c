@@ -1,16 +1,20 @@
 #include "version.h"
 #include <arpa/inet.h>
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <glob.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <termios.h>
@@ -49,6 +53,8 @@ bool DrawOSD = false;
 bool mspVTXenabled = false;
 bool vtxMenuEnabled = false;
 extern char* recording_dir;
+int MsposdFastShutdown = 0;
+static volatile sig_atomic_t ReloadRequested = 0;
 
 // libevent base main loop
 struct event_base *base = NULL;
@@ -64,6 +70,8 @@ bool enable_simple_uart = false;
 const char *default_master = "/dev/ttyAMA0";
 const int default_baudrate = 115200;
 const char *default_out_addr = "";
+#define DEFAULT_MSPOSD_CONFIG "/etc/msposd.conf"
+#define MSPOSD_LOCK_FILE "/tmp/msposd.lock"
 const char *default_in_addr = "127.0.0.1:0";
 const int RC_CHANNELS = 65;		// RC_CHANNELS ( #65 ) for regular MAVLINK RC Channels read
 								// (https://mavlink.io/en/messages/common.html#RC_CHANNELS)
@@ -112,8 +120,9 @@ static void print_usage() {
 		"	   --mspvtx      Enable mspvtx support\n"
 		"      --subtitle <path>  Enable OSD/SRT recording\n"
 		"	-v --verbose     Show debug info\n"
+		"	-C --config      Load config file (%s by default)\n"
 		"	-h --help        Display this help\n",
-			default_master, default_baudrate, default_out_addr);
+			default_master, default_baudrate, default_out_addr, DEFAULT_MSPOSD_CONFIG);
 }
 
 static speed_t speed_by_value(int baudrate) {
@@ -159,7 +168,7 @@ static bool parse_host_port(const char *s, struct in_addr *out_addr, in_port_t *
 
 	char *colon = strchr(host_and_port, ':');
 	if (NULL == colon) {
-		return -1;
+		return false;
 	}
 
 	*colon = '\0';
@@ -185,7 +194,18 @@ static void signal_cb(evutil_socket_t fd, short event, void *arg) {
 	struct event_base *base = arg;
 	(void)event;
 	AbortNow = true;
+	MsposdFastShutdown = 1;
 	printf("Exit Request: %s signal received\n", strsignal(fd));
+	event_base_loopbreak(base);
+}
+
+static void signal_reload_cb(evutil_socket_t fd, short event, void *arg) {
+	struct event_base *base = arg;
+	(void)event;
+	AbortNow = true;
+	MsposdFastShutdown = 1;
+	ReloadRequested = 1;
+	printf("Reload Request: %s signal received\n", strsignal(fd));
 	event_base_loopbreak(base);
 }
 
@@ -1092,9 +1112,9 @@ static void poll_msp(evutil_socket_t sock, short event, void *arg) {
 }
 
 static int handle_data(const char *port_name, int baudrate, const char *out_addr) {
-	struct event *sig_int = NULL, *in_ev = NULL, *temp_tmr = NULL, *msp_tmr = NULL;
-	struct event *sig_term;
+	struct event *sig_int = NULL, *sig_term = NULL, *sig_hup = NULL, *in_ev = NULL, *temp_tmr = NULL, *msp_tmr = NULL;
 	int ret = EXIT_SUCCESS;
+	MsposdFastShutdown = 0;
 
 	// Read from UDP
 	if (strlen(port_name) > 0 && port_name[0] >= '0' && port_name[0] <= '9') {
@@ -1187,6 +1207,8 @@ static int handle_data(const char *port_name, int baudrate, const char *out_addr
 	// Handle SIGTERM (e.g., killall myapp)
 	sig_term = evsignal_new(base, SIGTERM, signal_cb, base);
 	event_add(sig_term, NULL);
+	sig_hup = evsignal_new(base, SIGHUP, signal_reload_cb, base);
+	event_add(sig_hup, NULL);
 
 	// Test inject a simple packet to test malvink communication Camera to Ground
 	signal(SIGUSR1, sendtestmsg);
@@ -1281,6 +1303,9 @@ static int handle_data(const char *port_name, int baudrate, const char *out_addr
 	event_base_dispatch(base);
 
 err:
+	if (MsposdFastShutdown) {
+		return ret;
+	}
 	if (temp_tmr) {
 		event_del(temp_tmr);
 		event_free(temp_tmr);
@@ -1301,6 +1326,10 @@ err:
 
 	if (sig_int)
 		event_free(sig_int);
+	if (sig_term)
+		event_free(sig_term);
+	if (sig_hup)
+		event_free(sig_hup);
 
 	if (base)
 		event_base_free(base);
@@ -1332,8 +1361,138 @@ static void set_resolution(int width, int height) {
 	majestic_height = height;
 }
 
+
+typedef struct {
+	char port_name[128];
+	int baudrate;
+	char out_addr[64];
+	int rc_channel;
+	int wait_ms;
+	int fps;
+	int persist_ms;
+	bool temp_enabled;
+	bool wfb_enabled;
+	char folder[128];
+	bool has_folder;
+	bool draw_osd;
+	int ahi;
+	int matrix;
+	bool has_size;
+	int width;
+	int height;
+	bool mspvtx;
+	bool has_subtitle;
+	char subtitle[PATH_MAX];
+	bool verbose_enabled;
+	bool parse_msp;
+} runtime_opts_t;
+
+static int open_and_lock(const char *lock_file) {
+	int fd = open(lock_file, O_RDWR | O_CREAT, 0644);
+	if (fd < 0) {
+		perror(lock_file);
+		return -1;
+	}
+	if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+		fprintf(stderr, "Another msposd instance is already running.\\n");
+		close(fd);
+		return -1;
+	}
+	ftruncate(fd, 0);
+	dprintf(fd, "%ld\\n", (long)getpid());
+	return fd;
+}
+
+static void init_runtime_opts(runtime_opts_t *opts) {
+	memset(opts, 0, sizeof(*opts));
+	snprintf(opts->port_name, sizeof(opts->port_name), "%s", default_master);
+	opts->baudrate = default_baudrate;
+	snprintf(opts->out_addr, sizeof(opts->out_addr), "%s", default_out_addr);
+	opts->wait_ms = 2000;
+	opts->fps = 20;
+	opts->persist_ms = 2000;
+	opts->parse_msp = true;
+}
+
+static bool parse_bool_value(const char *value, bool *out) {
+	if (!value) return false;
+	if (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes") || !strcasecmp(value, "on")) {
+		*out = true;
+		return true;
+	}
+	if (!strcasecmp(value, "0") || !strcasecmp(value, "false") || !strcasecmp(value, "no") || !strcasecmp(value, "off")) {
+		*out = false;
+		return true;
+	}
+	return false;
+}
+
+static void trim(char *s) {
+	char *p = s;
+	while (*p && isspace((unsigned char)*p)) p++;
+	if (p != s) memmove(s, p, strlen(p) + 1);
+	for (int i = (int)strlen(s) - 1; i >= 0 && isspace((unsigned char)s[i]); --i) s[i] = '\0';
+}
+
+static void apply_cfg_pair(runtime_opts_t *opts, const char *key, const char *value) {
+	if (!strcasecmp(key, "master")) snprintf(opts->port_name, sizeof(opts->port_name), "%s", value);
+	else if (!strcasecmp(key, "baudrate")) opts->baudrate = atoi(value);
+	else if (!strcasecmp(key, "out")) snprintf(opts->out_addr, sizeof(opts->out_addr), "%s", value);
+	else if (!strcasecmp(key, "channels")) opts->rc_channel = atoi(value);
+	else if (!strcasecmp(key, "wait")) opts->wait_ms = atoi(value);
+	else if (!strcasecmp(key, "fps")) opts->fps = atoi(value);
+	else if (!strcasecmp(key, "persist")) opts->persist_ms = atoi(value);
+	else if (!strcasecmp(key, "folder")) { snprintf(opts->folder, sizeof(opts->folder), "%s", value); opts->has_folder = opts->folder[0] != '\0'; }
+	else if (!strcasecmp(key, "ahi")) opts->ahi = atoi(value);
+	else if (!strcasecmp(key, "matrix")) opts->matrix = atoi(value);
+	else if (!strcasecmp(key, "size")) { if (sscanf(value, "%dx%d", &opts->width, &opts->height) == 2) { opts->has_size = true; opts->draw_osd = true; } }
+	else if (!strcasecmp(key, "subtitle")) { snprintf(opts->subtitle, sizeof(opts->subtitle), "%s", value); opts->has_subtitle = opts->subtitle[0] != '\0'; }
+	else {
+		bool b = false;
+		if (!parse_bool_value(value, &b)) return;
+		if (!strcasecmp(key, "temp")) opts->temp_enabled = b;
+		else if (!strcasecmp(key, "wfb")) opts->wfb_enabled = b;
+		else if (!strcasecmp(key, "osd")) opts->draw_osd = b;
+		else if (!strcasecmp(key, "mspvtx")) opts->mspvtx = b;
+		else if (!strcasecmp(key, "verbose")) opts->verbose_enabled = b;
+		else if (!strcasecmp(key, "mavlink")) opts->parse_msp = !b;
+	}
+}
+
+static void load_config_file(const char *config_path, runtime_opts_t *opts) {
+	FILE *f = fopen(config_path, "r");
+	if (!f) return;
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		trim(line);
+		if (!line[0] || line[0] == '#') continue;
+		char *eq = strchr(line, '=');
+		if (!eq) continue;
+		*eq = '\0';
+		char *key = line;
+		char *value = eq + 1;
+		trim(key);
+		trim(value);
+		apply_cfg_pair(opts, key, value);
+	}
+	fclose(f);
+}
+
+static void resolve_config_path(int argc, char **argv, char *config_path, size_t size) {
+	snprintf(config_path, size, "%s", DEFAULT_MSPOSD_CONFIG);
+	for (int i = 1; i < argc; ++i) {
+		if ((!strcmp(argv[i], "-C") || !strcmp(argv[i], "--config")) && i + 1 < argc) {
+			snprintf(config_path, size, "%s", argv[i + 1]);
+			i++;
+		} else if (!strncmp(argv[i], "--config=", 9)) {
+			snprintf(config_path, size, "%s", argv[i] + 9);
+		}
+	}
+}
+
 int main(int argc, char **argv) {
 	const struct option long_options[] = {
+		{"config", required_argument, NULL, 'C'},
 		{"master", required_argument, NULL, 'm'},
 		{"baudrate", required_argument, NULL, 'b'},
 		{"out", required_argument, NULL, 'o'},
@@ -1350,166 +1509,127 @@ int main(int argc, char **argv) {
 		{"size", required_argument, NULL, 'z'},
 		{"mspvtx", no_argument, NULL, '1'},
 		{"subtitle", required_argument, NULL, 's'},
-		{"mavlink", required_argument, NULL, 'M'},
+		{"mavlink", no_argument, NULL, 'M'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
 
-	const char *port_name = default_master;
-	int baudrate = default_baudrate;
-	const char *out_addr = default_out_addr;
-	const char *in_addr = default_in_addr;
-	MinTimeBetweenScreenRefresh = 50;
-	last_board_temp = -100;
-
-	int opt = 0, r = 0;
-	int long_index = 0;
-	int rc_channel_no = 0;
+	int lock_fd = open_and_lock(MSPOSD_LOCK_FILE);
+	if (lock_fd < 0) return EXIT_FAILURE;
 
 	printf("Version: %s, compiled at: %s\n", GIT_VERSION, VERSION_STRING);
 
-	while ((opt = getopt_long_only(argc, argv, "m:b:o:c:w:r:p:tjf:da:x:z:1vMh",
-			long_options, &long_index)) != -1) {
+	char config_path[PATH_MAX];
+	resolve_config_path(argc, argv, config_path, sizeof(config_path));
+
+	runtime_opts_t opts;
+	init_runtime_opts(&opts);
+	load_config_file(config_path, &opts);
+
+	int opt = 0, long_index = 0;
+	optind = 1;
+	while ((opt = getopt_long_only(argc, argv, "C:m:b:o:c:w:r:p:tjf:da:x:z:1s:vMh", long_options, &long_index)) != -1) {
 		switch (opt) {
-		case 'm':
-			port_name = optarg;
-			printf("Listen on port: %s\n", port_name);
+		case 'C':
 			break;
-
-		case 'b':
-			baudrate = atoi(optarg);
-			break;
-
-		case 'o':
-			out_addr = optarg;
-			break;
-
-		case 'c':
-			rc_channel_no = atoi(optarg);
-			if (rc_channel_no == 0)
-				printf("rc_channels  monitoring disabled\n");
-			else {
-				printf("Monitoring RC channel: %d\n", rc_channel_no);
-				rc_channel_mon_enabled = true;
-				// The array is zero-based, so substract 1 from the index:
-				rc_channel_mon[rc_channel_no - 1] = true;
-			}
-			resetLastStartValues();
-			break;
-
-		case 'w':
-			wait_after_bash = atoi(optarg);
-			resetLastStartValues();
-			break;
-
-		case 'r':
-			r = atoi(optarg);
-			if (r > 1000) {
-				enable_simple_uart = true;
-				r = r % 1000;
-				printf("Simple UART Reading mode! %d\n", r);
-			}
-			MinTimeBetweenScreenRefresh = 1000 / r;
-			resetLastStartValues();
-			break;
-
-		case 'p':
-			ChannelPersistPeriodMS = atoi(optarg);
-			resetLastStartValues();
-			break;
-
-		case 't':
-			temp = 1;
-			break;
-
-		case 'j':
-			monitor_wfb = true;
-			break;
-
-		case 'f':
-			if (optarg != NULL) {
-				snprintf(MavLinkMsgFile, sizeof(MavLinkMsgFile), "%smavlink.msg", optarg);
-				snprintf(WfbLogFile, sizeof(MavLinkMsgFile), "%swfb.log", optarg);
-			}
-			break;
-
-		case 'd':
-			DrawOSD = true;
-			printf("MSP to OSD mode!\n");
-			break;
-
-		case 'a':
-			AHI_Enabled = atoi(optarg);
-			break;
-
-		case 'x':
-			matrix_size = atoi(optarg);
-			break;
-
-		case 'z': {
-			char buffer[16];
-			strncpy(buffer, optarg, sizeof(buffer));
-			char *limit = strchr(buffer, 'x');
-			if (limit) {
-				*limit = '\0';
-				set_resolution(atoi(buffer), atoi(limit + 1));
-				DrawOSD = true;
-			}
-			break;
-		}
-
-		case '1':
-			mspVTXenabled = true;
-			break;
-
-		case 's':
-		    recording_dir = strdup(optarg);
-			break;
-
-		case 'v':
-			verbose = true;
-			printf("Verbose mode!\n");
-			break;
-
-		case 'M':
-			ParseMSP = false;
-			printf("Mavlink mode\n");
-			break;
-
-		case 'h':
-		default:
+		case 'm': snprintf(opts.port_name, sizeof(opts.port_name), "%s", optarg); break;
+		case 'b': opts.baudrate = atoi(optarg); break;
+		case 'o': snprintf(opts.out_addr, sizeof(opts.out_addr), "%s", optarg); break;
+		case 'c': opts.rc_channel = atoi(optarg); break;
+		case 'w': opts.wait_ms = atoi(optarg); break;
+		case 'r': opts.fps = atoi(optarg); break;
+		case 'p': opts.persist_ms = atoi(optarg); break;
+		case 't': opts.temp_enabled = true; break;
+		case 'j': opts.wfb_enabled = true; break;
+		case 'f': snprintf(opts.folder, sizeof(opts.folder), "%s", optarg); opts.has_folder = true; break;
+		case 'd': opts.draw_osd = true; break;
+		case 'a': opts.ahi = atoi(optarg); break;
+		case 'x': opts.matrix = atoi(optarg); break;
+		case 'z': if (sscanf(optarg, "%dx%d", &opts.width, &opts.height) == 2) { opts.has_size = true; opts.draw_osd = true; } break;
+		case '1': opts.mspvtx = true; break;
+		case 's': snprintf(opts.subtitle, sizeof(opts.subtitle), "%s", optarg); opts.has_subtitle = true; break;
+		case 'v': opts.verbose_enabled = true; break;
+		case 'M': opts.parse_msp = false; break;
+		case 'h': default:
 			print_usage();
+			close(lock_fd);
 			return EXIT_SUCCESS;
 		}
 	}
 
-	strcpy(_port_name, port_name);
-	if (ParseMSP) {
-		// msp_process_data(rx_msp_state, serial_data[i]);
-		rx_msp_state = calloc(1, sizeof(msp_state_t));
-		rx_msp_state->cb = &rx_msp_callback;
-		// if (DrawOSD)
-		InitMSPHook(); // We need to create screen overlay if we gonna show message on screen
+	ReloadRequested = 0;
+	ParseMSP = opts.parse_msp;
+	DrawOSD = opts.draw_osd;
+	mspVTXenabled = opts.mspvtx;
+	monitor_wfb = opts.wfb_enabled;
+	temp = opts.temp_enabled ? 1 : 0;
+	AHI_Enabled = opts.ahi;
+	matrix_size = opts.matrix;
+	verbose = opts.verbose_enabled;
+	wait_after_bash = opts.wait_ms;
+	ChannelPersistPeriodMS = opts.persist_ms;
+	last_board_temp = -100;
 
-		if (false) { // Forwarding MSP enabled
-			// this opens the UDP port so that it can be used with file descriptors
-			socket_fd = bind_socket(MSP_PORT + 1);
-			// Connect the socket to the target address and port so that we can debug
-			struct sockaddr_in si_other;
-			memset((char *)&si_other, 0, sizeof(si_other));
-			si_other.sin_family = AF_INET;
-			si_other.sin_port = htons(MSP_PORT);
-			si_other.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // Loopback address (localhost)
-
-			if (connect(socket_fd, (struct sockaddr *)&si_other, sizeof(si_other)) == -1) {
-				perror("Failed to connect");
-				close(socket_fd);
-				return 1;
-			}
-		}
-		// loadfonts
+	if (opts.has_size) {
+		set_resolution(opts.width, opts.height);
 	}
 
-	return handle_data(port_name, baudrate, out_addr);
+	enable_simple_uart = false;
+	if (opts.fps > 1000) {
+		enable_simple_uart = true;
+		opts.fps %= 1000;
+		printf("Simple UART Reading mode! %d\n", opts.fps);
+	}
+	if (opts.fps <= 0) opts.fps = 20;
+	MinTimeBetweenScreenRefresh = 1000 / opts.fps;
+
+	memset(rc_channel_mon, 0, sizeof(rc_channel_mon));
+	rc_channel_mon_enabled = false;
+	if (opts.rc_channel > 0 && opts.rc_channel <= kChannelCount) {
+		rc_channel_mon_enabled = true;
+		rc_channel_mon[opts.rc_channel - 1] = true;
+		printf("Monitoring RC channel: %d\n", opts.rc_channel);
+	}
+	resetLastStartValues();
+
+	if (opts.has_folder) {
+		snprintf(MavLinkMsgFile, sizeof(MavLinkMsgFile), "%smavlink.msg", opts.folder);
+		snprintf(WfbLogFile, sizeof(WfbLogFile), "%swfb.log", opts.folder);
+	}
+	if (recording_dir) {
+		free(recording_dir);
+		recording_dir = NULL;
+	}
+	if (opts.has_subtitle) {
+		recording_dir = strdup(opts.subtitle);
+	}
+
+	strcpy(_port_name, opts.port_name);
+	if (ParseMSP) {
+		rx_msp_state = calloc(1, sizeof(msp_state_t));
+		rx_msp_state->cb = &rx_msp_callback;
+		InitMSPHook();
+	}
+
+	int ret = handle_data(opts.port_name, opts.baudrate, opts.out_addr);
+
+	if (ReloadRequested) {
+		printf("Reloading config from %s via process restart\n", config_path);
+		execv("/proc/self/exe", argv);
+		execvp(argv[0], argv);
+		perror("exec");
+		ret = EXIT_FAILURE;
+	}
+
+	if (rx_msp_state) {
+		free(rx_msp_state);
+		rx_msp_state = NULL;
+	}
+	if (recording_dir) {
+		free(recording_dir);
+		recording_dir = NULL;
+	}
+	close(lock_fd);
+	return ret;
 }

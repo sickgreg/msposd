@@ -151,9 +151,18 @@ void handle_osd_out() {
 	}
 }
 
-int inotify_fd;
-int watch_desc;
+int inotify_fd = -1;
+int watch_desc = -1;
 void setup_recording_watch(char *file_to_watch) {
+    if (watch_desc >= 0 && inotify_fd >= 0) {
+        inotify_rm_watch(inotify_fd, watch_desc);
+        watch_desc = -1;
+    }
+    if (inotify_fd >= 0) {
+        close(inotify_fd);
+        inotify_fd = -1;
+    }
+
     inotify_fd = inotify_init();
     if (inotify_fd == -1) {
         perror("inotify_init");
@@ -212,7 +221,9 @@ void check_recoding_file() {
             }
             recording_running = false;
             inotify_rm_watch(inotify_fd, watch_desc);
-            close(inotify_fd);            
+            watch_desc = -1;
+            close(inotify_fd);
+            inotify_fd = -1;
         }
         ptr += EVENT_SIZE + event->len;
     }
@@ -303,4 +314,37 @@ void inotify_callback(evutil_socket_t fd, short events, void* arg) {
 
         ptr += EVENT_SIZE + event->len;
     }
+}
+
+
+void subtitle_cleanup() {
+    if (srt_file) {
+        fclose(srt_file);
+        srt_file = NULL;
+    }
+    if (osd_file) {
+        fclose(osd_file);
+        osd_file = NULL;
+    }
+
+    if (watch_desc >= 0 && inotify_fd >= 0) {
+        inotify_rm_watch(inotify_fd, watch_desc);
+        watch_desc = -1;
+    }
+    if (inotify_fd >= 0) {
+        close(inotify_fd);
+        inotify_fd = -1;
+    }
+
+    free(srt_file_name);
+    srt_file_name = NULL;
+    free(osd_file_name);
+    osd_file_name = NULL;
+
+    subtitle_start_time = 0;
+    subtitle_current_time = 0;
+    sequence_number = 1;
+    last_flight_time_ms = 0;
+    last_hash = 0;
+    recording_running = false;
 }
