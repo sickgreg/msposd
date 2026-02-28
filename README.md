@@ -22,8 +22,12 @@ Usage: msposd [OPTIONS]
     --mspvtx      Enable alpha mspvtx functionality
     --subtitle <path>  Enable OSD/SRT recording
  -v --verbose     Show debug info
+ -C --config      Load config file (/etc/msposd.conf by default)
  --help           Display this help
 ```
+
+`msposd` can now read options from `/etc/msposd.conf` and reload them on `SIGHUP` without exiting.
+Order of precedence is: defaults, then config file, then command line options.
 
 **Support for two font sizes.** (on FullHD mode only!)  
 set --matrix  to a value 11 or higher, each value represents a template to be used to map the OSD config.  
