@@ -11,4 +11,3 @@ void write_srt_file();
 void handle_osd_out();
 void inotify_callback(evutil_socket_t fd, short events, void* arg);
 void check_recoding_file();
-void subtitle_cleanup();

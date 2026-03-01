@@ -107,10 +107,11 @@ static uint16_t msp_character_map_buffer[MAX_DISPLAY_X][MAX_DISPLAY_Y];
 static uint16_t msp_character_map_draw[MAX_DISPLAY_X][MAX_DISPLAY_Y];
 static msp_hd_options_e msp_hd_option = 0;
 static displayport_vtable_t *display_driver = NULL;
-
-uint8_t update_rate_hz = 2;
 static unsigned long long LastDrawn = 0;
 static unsigned long long LastPcktSent = 0;
+static bool osd_frame_dirty = true;
+static bool osd_canvas_initialized = false;
+static uint64_t LastFullCanvasRefresh = 0;
 
 static int MinTimeBetweenScreenRefresh;
 
@@ -210,7 +211,6 @@ int RCWidgetY = 0;
 char air_unit_info_msg[MAX_STATUS_MSG_LEN];
 
 extern bool AbortNow;
-extern int MsposdFastShutdown;
 extern bool verbose;
 extern struct sockaddr_in sin_out; //= {.sin_family = AF_INET,};
 extern int out_sock;
@@ -506,10 +506,10 @@ static void rx_msp_callback(msp_msg_t *msp_message) {
 
 	case MSP_CMD_DISPLAYPORT: {
 		if (msp_message->payload[0] == MSP_DISPLAYPORT_INFO_MSG) {
-			//msp_message->payload[255] = 0; // just in case. why, may crash ?! 
-			
+			//msp_message->payload[255] = 0; // just in case. why, may crash ?!
 			strcpy(air_unit_info_msg, &msp_message->payload[1]);
-			fill(air_unit_info_msg);//Strip font settings from the text and set color, alignment , size etc 
+			fill(air_unit_info_msg); // Strip font settings from the text and set color, alignment, size etc
+			osd_frame_dirty = true;
 			// printf("fill: %s\n", air_unit_info_msg);
 		}
 
@@ -681,6 +681,7 @@ void draw_character_on_console(int row, int col, char ch) {
 BITMAP bmpFntSmall;
 
 uint16_t character_map[MAX_OSD_WIDTH][MAX_OSD_HEIGHT];
+static uint16_t rendered_character_map[MAX_OSD_WIDTH][MAX_OSD_HEIGHT];
 
 struct osd *osds; // regions over the overlay
 
@@ -1440,6 +1441,8 @@ static char FECFile[128] = "./MSPOSD.msg";
 static char FECFile[128] = "/tmp/MSPOSD.msg";
 #endif
 
+uint64_t LastOSDMsgParsed = 0;
+
 void SetOSDMsg(char *msg) {
 
 	// Open the file for writing
@@ -1450,6 +1453,8 @@ void SetOSDMsg(char *msg) {
 		fprintf(file, "%s", msg);
 		fclose(file);
 	}
+	LastOSDMsgParsed = 0;
+	osd_frame_dirty = true;
 
 	// this will send the message to ground even if no data is available on the
 	// uart
@@ -1467,9 +1472,196 @@ void SetOSDMsg(char *msg) {
 	*/
 }
 
-uint64_t LastOSDMsgParsed = 0;
-
 BITMAP bitmapText;
+static bool osd_message_template_dynamic = false;
+static bool osd_message_overlay_drawn = false;
+static uint32_t osd_message_last_x = 0;
+static uint32_t osd_message_last_y = 0;
+static uint32_t osd_message_last_width = 0;
+static uint32_t osd_message_last_height = 0;
+
+static int get_message_refresh_interval_ms(void) {
+	int hz = OSD_MessageRate;
+	if (hz < 1)
+		hz = 1;
+	if (hz > 50)
+		hz = 50;
+	return 1000 / hz;
+}
+
+static bool osd_message_refresh_due(uint64_t timems) {
+	return (timems - LastOSDMsgParsed) >= (uint64_t)get_message_refresh_interval_ms();
+}
+
+static bool osd_message_template_is_dynamic(const char *msg) {
+	const char *token = msg;
+	while ((token = strchr(token, '&')) != NULL) {
+		char marker = token[1];
+		if (marker == '\0')
+			break;
+		switch (marker) {
+		case 'Z':
+		case 'C':
+		case 'B':
+		case 'p':
+		case 't':
+		case 'T':
+		case 'W':
+			return true;
+		default:
+			break;
+		}
+		token++;
+	}
+	return false;
+}
+
+static bool osd_message_work_due(uint64_t timems) {
+	if (!osd_message_refresh_due(timems))
+		return false;
+	if (osd_msg_enabled && osd_message_template_dynamic)
+		return true;
+	return access(FECFile, F_OK) == 0;
+}
+
+static bool full_canvas_refresh_due(uint64_t timems) {
+	const uint64_t refresh_interval_ms = 3000;
+
+	if (!DrawOSD || !useDirectBMPBuffer || !osd_canvas_initialized)
+		return false;
+
+	return (timems - LastFullCanvasRefresh) >= refresh_interval_ms;
+}
+
+static bool overlay_motion_active(void) {
+	if ((msg_layout % 4) != 3)
+		return false;
+	return (osd_msg_enabled && bitmapText.pData != NULL) || strlen(air_unit_info_msg) > 1;
+}
+
+static bool can_use_incremental_osd(void) {
+	if (!DrawOSD)
+		return false;
+	if (AHI_Enabled)
+		return false;
+	if (matrix_size > 10)
+		return false;
+	if (air_unit_info_msg[0] != '\0')
+		return false;
+	return true;
+}
+
+static void clear_bitmap_rect(uint32_t destX, uint32_t destY, uint32_t width, uint32_t height) {
+	if (bmpBuff.pData == NULL || width == 0 || height == 0)
+		return;
+
+	if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4) {
+		uint32_t stride = bmpBuff.u32Width / 2;
+		uint8_t *dest = bmpBuff.pData;
+		if ((destX % 2) == 0 && (width % 2) == 0) {
+			uint32_t rowBytes = width / 2;
+			for (uint32_t y = 0; y < height; ++y)
+				memset(dest + (destY + y) * stride + destX / 2, 0xFF, rowBytes);
+			return;
+		}
+
+		for (uint32_t y = 0; y < height; ++y) {
+			uint8_t *row = dest + (destY + y) * stride;
+			for (uint32_t x = 0; x < width; ++x) {
+				uint32_t pixelX = destX + x;
+				uint8_t *byte = row + pixelX / 2;
+				if ((pixelX % 2) == 0)
+					*byte = (*byte & 0x0F) | 0xF0;
+				else
+					*byte = (*byte & 0xF0) | 0x0F;
+			}
+		}
+		return;
+	}
+
+	if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_1555) {
+		uint8_t *dest = bmpBuff.pData;
+		uint32_t stride = bmpBuff.u32Width * sizeof(uint16_t);
+		uint32_t rowBytes = width * sizeof(uint16_t);
+		for (uint32_t y = 0; y < height; ++y)
+			memset(dest + (destY + y) * stride + destX * sizeof(uint16_t), 0x00, rowBytes);
+		return;
+	}
+
+	if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_8888) {
+		uint8_t *dest = bmpBuff.pData;
+		uint32_t stride = bmpBuff.u32Width * sizeof(uint32_t);
+		uint32_t rowBytes = width * sizeof(uint32_t);
+		for (uint32_t y = 0; y < height; ++y)
+			memset(dest + (destY + y) * stride + destX * sizeof(uint32_t), 0x00, rowBytes);
+	}
+}
+
+static void draw_bitmap_char(uint32_t x, uint32_t y, uint16_t c) {
+	if (c == 0 || bitmapFnt.pData == NULL)
+		return;
+
+	uint8_t page = 0;
+	if (c > 255) {
+		page = (c >> 8) & 0x03;
+		c = c & 0xFF;
+	}
+
+	u_int16_t s_left = page * current_display_info.font_width;
+	u_int16_t s_top = current_display_info.font_height * c;
+	u_int16_t s_width = current_display_info.font_width;
+	u_int16_t s_height = current_display_info.font_height;
+	u_int16_t d_x = x * current_display_info.font_width + X_OFFSET;
+	u_int16_t d_y = y * current_display_info.font_height;
+
+	if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_1555)
+		copyRectARGB1555(bitmapFnt.pData, bitmapFnt.u32Width, bitmapFnt.u32Height, bmpBuff.pData,
+			bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height, d_x, d_y);
+	else if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4)
+		copyRectI4(bitmapFnt.pData, bitmapFnt.u32Width, bitmapFnt.u32Height, bmpBuff.pData,
+			bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height, d_x, d_y);
+	else if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_8888)
+		copyRectRGBA8888(bitmapFnt.pData, bitmapFnt.u32Width, bitmapFnt.u32Height, bmpBuff.pData,
+			bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height, d_x, d_y);
+	else
+		copyRectI8(bitmapFnt.pData, bitmapFnt.u32Width, bitmapFnt.u32Height, bmpBuff.pData,
+			bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height, d_x, d_y);
+}
+
+static void restore_osd_rect(uint32_t destX, uint32_t destY, uint32_t width, uint32_t height) {
+	if (width == 0 || height == 0)
+		return;
+
+	clear_bitmap_rect(destX, destY, width, height);
+
+	if (!DrawOSD || bitmapFnt.pData == NULL)
+		return;
+
+	int rect_left = (int)destX - X_OFFSET;
+	int rect_right = (int)(destX + width - 1) - X_OFFSET;
+	if (rect_right < 0)
+		return;
+
+	int start_x = rect_left <= 0 ? 0 : rect_left / current_display_info.font_width;
+	int end_x = rect_right / current_display_info.font_width;
+	if (start_x >= current_display_info.char_width)
+		return;
+	if (end_x < 0)
+		return;
+	if (end_x >= current_display_info.char_width)
+		end_x = current_display_info.char_width - 1;
+
+	int start_y = (int)destY / current_display_info.font_height;
+	int end_y = (int)(destY + height - 1) / current_display_info.font_height;
+	if (start_y >= current_display_info.char_height)
+		return;
+	if (end_y >= current_display_info.char_height)
+		end_y = current_display_info.char_height - 1;
+
+	for (int y = start_y; y <= end_y; ++y)
+		for (int x = start_x; x <= end_x; ++x)
+			draw_bitmap_char(x, y, character_map[x][y]);
+}
 
 void print_string_as_hex(const char *str) {
 	while (*str) {
@@ -1508,60 +1700,66 @@ char osdmsg[MAX_STATUS_MSG_LEN];
 char ready_osdmsg[MAX_STATUS_MSG_LEN+1];
 
 bool DrawTextOnOSDBitmap(char *msg) {
-	char *font;
+	char font[256];
+	bool inline_msg = (msg != NULL && msg[0] != '\0');
+	uint64_t timems = get_time_ms();
+	bool refresh_due = inline_msg || osd_message_refresh_due(timems);
+	bool message_updated = inline_msg;
 #ifdef _x86
-	asprintf(&font, "fonts/%s.ttf", osds[FULL_OVERLAY_ID].font);
+	snprintf(font, sizeof(font), "fonts/%s.ttf", osds[FULL_OVERLAY_ID].font);
 #else
-	asprintf(&font, "/usr/share/fonts/truetype/%s.ttf", osds[FULL_OVERLAY_ID].font);
+	snprintf(font, sizeof(font), "/usr/share/fonts/truetype/%s.ttf", osds[FULL_OVERLAY_ID].font);
 #endif
 
-	if (!osd_msg_enabled) {
-		if ((get_time_ms() - LastOSDMsgParsed) < 1000) { // If msgs are not needed, do not check for
-														 // file every frame, but once per second
-			// printf("skipped msg osd check\n");
-			return false;
-		}
-		LastOSDMsgParsed = get_time_ms(); // Do not parse and read variable too often
-	}
-
-	bool res = false;
-	int result;
 	char out[MAX_STATUS_MSG_LEN];
 	size_t bytesRead = 0;
 
 	FILE *file = NULL;
-	if (msg == NULL || strlen(msg) == 0) {
-		file = fopen(FECFile, "rb");
-		if (file != NULL) { // New file, will have to render the font
-			bytesRead = fread(osdmsg, 1, MAX_STATUS_MSG_LEN /*max buffer*/, file); // with files
-			fclose(file);
-			remove(FECFile);
-			osdmsg[bytesRead] = 0; // end of string
-			osds[FULL_OVERLAY_ID].updt = 1;
-			osd_msg_enabled = true;
+	if (!inline_msg) {
+		if (!osd_msg_enabled && !refresh_due)
+			return false;
+		if (refresh_due) {
+			LastOSDMsgParsed = timems;
+			file = fopen(FECFile, "rb");
+			if (file != NULL) { // New file, will have to render the font
+				bytesRead = fread(osdmsg, 1, MAX_STATUS_MSG_LEN /*max buffer*/, file); // with files
+				fclose(file);
+				remove(FECFile);
+				osdmsg[bytesRead] = 0; // end of string
+				osd_message_template_dynamic = osd_message_template_is_dynamic(osdmsg);
+				osds[FULL_OVERLAY_ID].updt = 1;
+				osd_msg_enabled = true;
+				message_updated = true;
+			}
 		}
 		if (osd_msg_enabled == false)
 			return false;
-	} else
+	} else {
 		strcpy(osdmsg, msg);
+		osd_message_template_dynamic = osd_message_template_is_dynamic(osdmsg);
+	}
 
-	uint64_t timems = get_time_ms();
-	if (osds[FULL_OVERLAY_ID].updt == 1 ||
-		(timems - LastOSDMsgParsed) >
-			1000) {				   // Update varaibles in Message and render the text as BMP
-		LastOSDMsgParsed = timems; // Do not parse and read variable too often
+	bool rerender_text =
+		osds[FULL_OVERLAY_ID].updt == 1 || message_updated || (refresh_due && osd_message_template_dynamic);
+	bool incremental_overlay = can_use_incremental_osd() && osd_canvas_initialized;
+
+	if (rerender_text) { // Update variables and render the text BMP
+		if (incremental_overlay && osd_message_overlay_drawn)
+			restore_osd_rect(
+				osd_message_last_x, osd_message_last_y, osd_message_last_width, osd_message_last_height);
+		osd_message_overlay_drawn = false;
 
 		strcpy(out, osdmsg);
 		int L[20]={0}, F[20]={0};  // Support up to 20 lines
 
 		if (strstr(out, "&")) {
-			//Allow for color and size setting per line, must be here since the fill() function will strip that info 			
-			if (DrawOSD)//Only on the air unit
-    			parse_LF(out, L, F, 20);
+			// Allow for color/size per line before fill() strips the markers.
+			if (DrawOSD) // Only on the air unit
+				parse_LF(out, L, F, 20);
 
 			fill(out);
-			osds[FULL_OVERLAY_ID].updt = 0; //
 		}
+		osds[FULL_OVERLAY_ID].updt = 0;
 
 		// rendering text on goke  makes the program crash?! Need to fix.
 		//  so we simply send it to the ground
@@ -1688,7 +1886,11 @@ bool DrawTextOnOSDBitmap(char *msg) {
 			bitmapText.pData = (void *)destBitmap;			 // replace it with I4, same size
 			bitmapText.enPixelFormat = PIXEL_FORMAT_DEFAULT; // E_MI_RGN_PIXEL_FORMAT_I8; //I8
 		}
-	}
+			osd_frame_dirty = true;
+		}
+
+	if (bitmapText.pData == NULL)
+		return false;
 
 	int posX = 5, posY = 5;
 
@@ -1702,6 +1904,13 @@ bool DrawTextOnOSDBitmap(char *msg) {
 		posX = 2 + ((timems / 16) % (bmpBuff.u32Width - bitmapText.u32Width - 8)) & ~1;
 	posY = (msg_layout / 4) == 0 ? 0 : (bmpBuff.u32Height - bitmapText.u32Height) - 2;
 
+	if (incremental_overlay && osd_message_overlay_drawn &&
+		(rerender_text || posX != (int)osd_message_last_x || posY != (int)osd_message_last_y ||
+		 bitmapText.u32Width != osd_message_last_width ||
+		 bitmapText.u32Height != osd_message_last_height))
+		restore_osd_rect(
+			osd_message_last_x, osd_message_last_y, osd_message_last_width, osd_message_last_height);
+
 	if (bitmapText.pData != NULL && bitmapText.enPixelFormat == PIXEL_FORMAT_I4) {
 		copyRectI4(bitmapText.pData, bitmapText.u32Width, bitmapText.u32Height, bmpBuff.pData,
 			bmpBuff.u32Width, bmpBuff.u32Height,
@@ -1714,6 +1923,14 @@ bool DrawTextOnOSDBitmap(char *msg) {
 			bmpBuff.u32Width, bmpBuff.u32Height,
 			// 0,0,bitmapText.u32Width,bitmapText.u32Height,
 			0, 0, bitmapText.u32Width, bitmapText.u32Height, posX, posY);
+	}
+
+	if (DrawOSD) {
+		osd_message_overlay_drawn = true;
+		osd_message_last_x = posX;
+		osd_message_last_y = posY;
+		osd_message_last_width = bitmapText.u32Width;
+		osd_message_last_height = bitmapText.u32Height;
 	}
 
 	return true;
@@ -1835,21 +2052,30 @@ static bool ReplaceWidgets_Slow(int *x, int *y) {
 }
 
 static void draw_screenBMP() {
+	uint64_t now = get_time_ms();
 	uint64_t step2 = 0;
 	if (cntr++ < 0) // skip in the beginning to show to font preview
 		return;
 
-	if (!DrawOSD && (get_time_ms() - LastDrawn) < 200) // No need to redraw text on screen
+	if (!DrawOSD && (now - LastDrawn) < 200) // No need to redraw text on screen
 													   // so often, lets keep low CPU load
 		return;
 
-	if ((get_time_ms() - LastDrawn) <
+	if ((now - LastDrawn) <
 		MinTimeBetweenScreenRefresh) { // Set some delay to keep CPU load low
 		stat_skipped_frames++;
 		return;
 	}
 
-	if ((get_time_ms() - LastCleared) < 2) {
+	bool force_full_refresh = full_canvas_refresh_due(now);
+
+	if (!osd_frame_dirty && !osd_message_work_due(now) && !overlay_motion_active() &&
+		!force_full_refresh) {
+		stat_skipped_frames++;
+		return;
+	}
+
+	if ((now - LastCleared) < 2) {
 		// at least 2ms to reload some data after clearscreen, otherwise the
 		// screen will blink? but if there is too few chars to show we may never
 		// render it printf("%lu DrawSkipped after clear LastDrawn:%lu |
@@ -1857,7 +2083,8 @@ static void draw_screenBMP() {
 		// (uint32_t) LastCleared%10000); return ;
 	}
 
-	LastDrawn = get_time_ms();
+	LastDrawn = now;
+	bool incremental = can_use_incremental_osd() && osd_canvas_initialized && !force_full_refresh;
 
 	if (bmpBuff.pData == NULL) {
 		bmpBuff.enPixelFormat = PIXEL_FORMAT_DEFAULT;
@@ -1869,13 +2096,16 @@ static void draw_screenBMP() {
 		if (useDirectBMPBuffer) {
 			//We need to get pointer to the canvas mem every iteration
 			bmpBuff.pData = get_directBMP(osds[FULL_OVERLAY_ID].hand);
-			// clear the image, since it contains the last one
-			memset(bmpBuff.pData, PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4 ? 0xFF : 0x00,
-				bmpBuff.u32Height * getRowStride(bmpBuff.u32Width, PIXEL_FORMAT_BitsPerPixel));
+			if (!incremental)
+				memset(bmpBuff.pData, PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4 ? 0xFF : 0x00,
+					bmpBuff.u32Height * getRowStride(bmpBuff.u32Width, PIXEL_FORMAT_BitsPerPixel));
 		} else
 			bmpBuff.pData = malloc(
 				bmpBuff.u32Height * getRowStride(bmpBuff.u32Width, PIXEL_FORMAT_BitsPerPixel));
-	} else
+		if (!incremental)
+			memset(bmpBuff.pData, PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4 ? 0xFF : 0x00,
+				bmpBuff.u32Height * getRowStride(bmpBuff.u32Width, PIXEL_FORMAT_BitsPerPixel));
+	} else if (!incremental)
 		bmpBuff.pData = memset(bmpBuff.pData, PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4 ? 0xFF : 0x00,
 			bmpBuff.u32Height * getRowStride(bmpBuff.u32Width, PIXEL_FORMAT_BitsPerPixel));
 	// bmpBuff.pData = memset(bmpBuff.pData,  0xFF , bmpBuff.u32Height *
@@ -1884,74 +2114,96 @@ static void draw_screenBMP() {
 	bmpBuff.enPixelFormat = PIXEL_FORMAT_DEFAULT; //  PIXEL_FORMAT_DEFAULT ;//PIXEL_FORMAT_1555;
 
 	if (DrawOSD) { // If we only need message without icons
-		bool try_smaller_font = false;
-		for (int y = 0; y < current_display_info.char_height; y++) {
-
-			for (int x = 0; x < current_display_info.char_width; x++) {
-
-				if (AbortNow) { // There is request to close app, do not copy to
-								// buffer since it may be disposed already.
-					printf("Drawing aborted!\n");
-					return;
-				}
-
-				uint16_t c = character_map[x][y];
-
-				// if (ReplaceWidgets_Slow(&x,&y)) // Logic moved to InjectChars
-				//     continue;
-
-				if (c != 0 && bitmapFnt.pData != NULL) { // If there is now font, no drawing
-					uint8_t page = 0;
-					if (c > 255) {
-						page = (c >> 8) & 0x03;
-						c = c & 0xFF;
+		if (incremental) {
+			for (int y = 0; y < current_display_info.char_height; y++) {
+				for (int x = 0; x < current_display_info.char_width; x++) {
+					if (AbortNow) {
+						printf("Drawing aborted!\n");
+						return;
 					}
 
-					// Find the coordinates if the the rectangle in the Font
-					// Bitmap
-					u_int16_t s_left = page * current_display_info.font_width;
-					u_int16_t s_top = current_display_info.font_height * c;
-					u_int16_t s_width = current_display_info.font_width;
-					u_int16_t s_height = current_display_info.font_height;
-					// the location in the screen bmp where we will place the
-					// character glyph
-					u_int16_t d_x = x * current_display_info.font_width + X_OFFSET;
-					u_int16_t d_y = y * current_display_info.font_height;
-					BITMAP fnt = bitmapFnt;
+					uint16_t current = character_map[x][y];
+					if (rendered_character_map[x][y] == current)
+						continue;
 
-					if (matrix_size > 10 && bmpFntSmall.u32Width > 0 && try_smaller_font || y == 0)
-						Convert2SmallGlyph(
-							&fnt, &s_left, &s_top, &s_width, &s_height, &d_x, &d_y, x, y, c, page);
-
-					if (y == 0) // If there is no symbol on first line, assume
-								// this is statisctics screen.
-						try_smaller_font = true;
-
-					// if (cntr<40)
-					//     printf("Using direct canvas memory mode! size:%d:%d
-					//     stride:\n
-					//     ",bmpBuff.u32Width,bmpBuff.u32Height,getRowStride(bmpBuff.u32Width
-					//     , PIXEL_FORMAT_BitsPerPixel));
-					if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_1555)
-						copyRectARGB1555(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
-							bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
-							d_x, d_y);
-					else if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4)
-						copyRectI4(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
-							bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
-							d_x, d_y);
-					else if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_8888)
-						copyRectRGBA8888(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
-							bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
-							d_x, d_y);
-					else
-						copyRectI8(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
-							bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
-							d_x, d_y);
-
-				} else {
+					clear_bitmap_rect(x * current_display_info.font_width + X_OFFSET,
+						y * current_display_info.font_height, current_display_info.font_width,
+						current_display_info.font_height);
+					draw_bitmap_char(x, y, current);
+					rendered_character_map[x][y] = current;
 				}
 			}
+		} else {
+			bool try_smaller_font = false;
+			for (int y = 0; y < current_display_info.char_height; y++) {
+
+				for (int x = 0; x < current_display_info.char_width; x++) {
+
+					if (AbortNow) { // There is request to close app, do not copy to
+									// buffer since it may be disposed already.
+						printf("Drawing aborted!\n");
+						return;
+					}
+
+					uint16_t c = character_map[x][y];
+
+					// if (ReplaceWidgets_Slow(&x,&y)) // Logic moved to InjectChars
+					//     continue;
+
+					if (c != 0 && bitmapFnt.pData != NULL) { // If there is now font, no drawing
+						uint8_t page = 0;
+						if (c > 255) {
+							page = (c >> 8) & 0x03;
+							c = c & 0xFF;
+						}
+
+						// Find the coordinates if the the rectangle in the Font
+						// Bitmap
+						u_int16_t s_left = page * current_display_info.font_width;
+						u_int16_t s_top = current_display_info.font_height * c;
+						u_int16_t s_width = current_display_info.font_width;
+						u_int16_t s_height = current_display_info.font_height;
+						// the location in the screen bmp where we will place the
+						// character glyph
+						u_int16_t d_x = x * current_display_info.font_width + X_OFFSET;
+						u_int16_t d_y = y * current_display_info.font_height;
+						BITMAP fnt = bitmapFnt;
+
+						if (matrix_size > 10 && bmpFntSmall.u32Width > 0 && try_smaller_font || y == 0)
+							Convert2SmallGlyph(
+								&fnt, &s_left, &s_top, &s_width, &s_height, &d_x, &d_y, x, y, c, page);
+
+						if (y == 0) // If there is no symbol on first line, assume
+									// this is statisctics screen.
+							try_smaller_font = true;
+
+						// if (cntr<40)
+						//     printf("Using direct canvas memory mode! size:%d:%d
+						//     stride:\n
+						//     ",bmpBuff.u32Width,bmpBuff.u32Height,getRowStride(bmpBuff.u32Width
+						//     , PIXEL_FORMAT_BitsPerPixel));
+						if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_1555)
+							copyRectARGB1555(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
+								bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
+								d_x, d_y);
+						else if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4)
+							copyRectI4(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
+								bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
+								d_x, d_y);
+						else if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_8888)
+							copyRectRGBA8888(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
+								bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
+								d_x, d_y);
+						else
+							copyRectI8(fnt.pData, fnt.u32Width, fnt.u32Height, bmpBuff.pData,
+								bmpBuff.u32Width, bmpBuff.u32Height, s_left, s_top, s_width, s_height,
+								d_x, d_y);
+
+					} else {
+					}
+				}
+			}
+			memcpy(rendered_character_map, character_map, sizeof(character_map));
 		}
 
 		step2 = get_time_ms();
@@ -2056,7 +2308,11 @@ static void draw_screenBMP() {
 			// step2),(uint32_t)(get_time_ms()
 			// - step3));
 
-#endif
+	#endif
+	osd_canvas_initialized = DrawOSD;
+	if (DrawOSD && !incremental)
+		LastFullCanvasRefresh = now;
+	osd_frame_dirty = false;
 	stat_draw_overlay_1 += (uint32_t)(get_time_ms() - LastDrawn);
 	stat_draw_overlay_2 += (uint32_t)(get_time_ms() - step2);
 	stat_draw_overlay_3 += (uint32_t)(get_time_ms() - step3);
@@ -2074,7 +2330,10 @@ static void draw_character(uint32_t x, uint32_t y, uint16_t c) {
 		return;
 	}
 
-	character_map[x][y] = c;
+	if (character_map[x][y] != c) {
+		character_map[x][y] = c;
+		osd_frame_dirty = true;
+	}
 }
 
 static void clear_screen() {
@@ -2090,8 +2349,8 @@ static void clear_screen() {
 				bmpBuff.u32Height * getRowStride(bmpBuff.u32Width, PIXEL_FORMAT_BitsPerPixel));
 		// bmpBuff.pData = memset(bmpBuff.pData, 0xFF , (bmpBuff.u32Height *
 		// bmpBuff.u32Width * PIXEL_FORMAT_BitsPerPixel / 8) );
-
 		LastCleared = (get_time_ms());
+		osd_frame_dirty = true;
 		// printf("%lu Clear screen\n",(uint32_t)(LastCleared%10000));
 		// LastDrawn=(get_time_ms())+500;///give 200ms no refresh  to load data
 		// in buffer
@@ -2363,6 +2622,14 @@ bool LoadFont() {
 
 static void InitMSPHook() {
 	memset(character_map, 0, sizeof(character_map));
+	memset(rendered_character_map, 0xFF, sizeof(rendered_character_map));
+	osd_canvas_initialized = false;
+	LastFullCanvasRefresh = 0;
+	osd_message_overlay_drawn = false;
+	osd_message_last_x = 0;
+	osd_message_last_y = 0;
+	osd_message_last_width = 0;
+	osd_message_last_height = 0;
 	font_suffix = "";
 
 	PIXEL_FORMAT_DEFAULT = PIXEL_FORMAT_1555; // ARGB1555 format, 16 bits per pixel
@@ -2635,50 +2902,28 @@ static void CloseMSP() {
 
 	int deinit = 0;
 	int s32Ret = 0;
-#ifdef __SIGMASTAR__
-	// s32Ret = MI_RGN_Destroy(&osds[FULL_OVERLAY_ID].hand);
-	if (DrawOSD){
-		if (MsposdFastShutdown) {
-			printf("Fast signal shutdown requested, skipping SigmaStar RGN deinit path.\n");
-		} else {
-			s32Ret = unload_region(&osds[FULL_OVERLAY_ID].hand);
-
-			deinit = MI_RGN_DeInit(DEV2);
-			if (deinit)
-				printf("[%s:%d]RGN_DeInit failed with %#x!\n", __func__, __LINE__, s32Ret);
-		}
-	}
-#endif
+		#ifdef __SIGMASTAR__
+			if (DrawOSD) {
+				printf("[%s:%d]Skipping SigmaStar RGN teardown and waiting before exit\n",
+					__func__, __LINE__);
+				usleep(500000);
+			}
+		#endif
 #if defined(_x86) || defined(__ROCKCHIP__)
 	Close();
-#endif
+#endif	
 
-	subtitle_cleanup();
-
-	if (bitmapFnt.pData != NULL) {
+	if (bitmapFnt.pData != NULL)
 		free(bitmapFnt.pData);
-		bitmapFnt.pData = NULL;
-	}
-	if (bmpBuff.pData != NULL && !useDirectBMPBuffer) {
+	if (bmpBuff.pData != NULL && !useDirectBMPBuffer)
 		free(bmpBuff.pData);
-	}
-	bmpBuff.pData = NULL;
-	if (bmpFntSmall.pData != NULL) {
+	if (bmpFntSmall.pData != NULL)
 		free(bmpFntSmall.pData);
-		bmpFntSmall.pData = NULL;
-	}
-
-	if (display_driver != NULL) {
-		free(display_driver);
-		display_driver = NULL;
-	}
-
-	printf("TrueType Font released: %d\n", FreeCachedFont(sft.font));
-
+	
+	printf("TrueType Font released: %d\n",FreeCachedFont(sft.font) );
+ 
 	//int res_mun = munmap(osds, sizeof(*osds) * MAX_OSD);
-	if (osds != NULL) {
+	if (osds!=NULL)
 		free(osds);
-		osds = NULL;
-	}
 	printf("RGN_Destroy: %X, RGN_DeInit: %X\n", s32Ret, deinit);
 }

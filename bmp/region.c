@@ -1,4 +1,5 @@
 #include "region.h"
+#include <unistd.h>
 
 
 #if defined(__INFINITY6C__)
@@ -18,6 +19,27 @@ int PIXEL_FORMAT_DEFAULT = 3; // 0 for PIXEL_FORMAT_1555 , 4 for E_MI_RGN_PIXEL_
 
 extern bool verbose;
 const double inv16 = 1.0 / 16.0;
+
+#ifdef __SIGMASTAR__
+static void hide_region_port_if_attached(int handle, MI_RGN_ChnPort_t *stChn) {
+	MI_RGN_ChnPortParam_t stChnAttr;
+	int s32Ret;
+
+	s32Ret = MI_RGN_GetDisplayAttr(DEV handle, stChn, &stChnAttr);
+	if (s32Ret)
+		return;
+
+	if (!stChnAttr.bShow)
+		return;
+
+	stChnAttr.bShow = 0;
+	s32Ret = MI_RGN_AttachToChn(DEV handle, stChn, &stChnAttr);
+	if (s32Ret && verbose) {
+		fprintf(stderr, "[%s:%d]RGN hide failed with %#x on chn %d port %d!\n",
+			__func__, __LINE__, s32Ret, stChn->s32ChnId, stChn->s32OutputPortId);
+	}
+}
+#endif
 
 
 
@@ -440,6 +462,8 @@ int unload_region(int *handle) {
 	int s32Ret = 0;
 #ifdef __SIGMASTAR__
 	MI_RGN_ChnPort_t stChn;
+	MI_RGN_ChnPort_t stChnSecond;
+	int detachRet = 0;
 #if __INFINITY6C__
 	stChn.eModId = E_MI_MODULE_ID_VENC;
 #else
@@ -448,13 +472,40 @@ int unload_region(int *handle) {
 	stChn.s32DevId = 0;
 	stChn.s32ChnId = 0;
 	stChn.s32OutputPortId = 0;
+	stChnSecond = stChn;
 
-	MI_RGN_DetachFromChn(DEV *handle, &stChn);
+#if __INFINITY6C__
+	stChnSecond.s32ChnId = 1;
+	stChnSecond.s32OutputPortId = 1;
+#else
+	stChnSecond.s32OutputPortId = 1;
+#endif
+
+	hide_region_port_if_attached(*handle, &stChn);
+	hide_region_port_if_attached(*handle, &stChnSecond);
+	usleep(50000);
+
+	detachRet = MI_RGN_DetachFromChn(DEV *handle, &stChn);
+	if (detachRet && detachRet != MI_ERR_RGN_UNEXIST) {
+		fprintf(stderr, "[%s:%d]RGN_DetachFromChn failed with %#x on chn %d port %d!\n",
+			__func__, __LINE__, detachRet, stChn.s32ChnId, stChn.s32OutputPortId);
+		}
+
+	detachRet = MI_RGN_DetachFromChn(DEV *handle, &stChnSecond);
+	if (detachRet && detachRet != MI_ERR_RGN_UNEXIST) {
+		fprintf(stderr, "[%s:%d]RGN_DetachFromChn failed with %#x on chn %d port %d!\n",
+			__func__, __LINE__, detachRet, stChnSecond.s32ChnId, stChnSecond.s32OutputPortId);
+		}
+
+	usleep(50000);
+
 	s32Ret = MI_RGN_Destroy(DEV *handle);
 	if (s32Ret)
 		fprintf(stderr, "[%s:%d]RGN_Destroy failed with %#x %d!\n", __func__, __LINE__, s32Ret,
 			*handle);
-#elif __GOKE__
+	else
+		*handle = MI_RGN_HANDLE_NULL;
+	#elif __GOKE__
 	MPP_CHN_S stChn;
 	stChn.s32DevId = 0;
 	stChn.s32ChnId = 0;
