@@ -78,3 +78,4 @@ UART mode note:
 - Instead of calling `MI_RGN_DetachFromChn()`, `MI_RGN_Destroy()`, or `MI_RGN_DeInit()` during exit, the process waits briefly (`500 ms`) and exits.
 - This is deliberate: repeated restart testing showed that touching SigmaStar RGN teardown APIs during process exit made restart stability worse than leaving cleanup to the platform.
 - If your integration restarts `msposd` on resolution changes, this "do less on exit" behavior is the recommended path.
+- See [docs/sigmastar-rgn-restart-notes.md](./docs/sigmastar-rgn-restart-notes.md) for the serial error signatures, tested teardown variants, and the reasoning behind this behavior.
