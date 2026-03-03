@@ -71,11 +71,22 @@ UART mode note:
 - Main OSD rendering uses incremental redraws when possible instead of rebuilding the entire canvas every frame.
 - `MSPOSD.msg` updates are throttled separately from the main render rate and only rerasterize on content changes or dynamic token refreshes.
 - The direct SigmaStar canvas path performs a periodic full-canvas resync every 3 seconds to recover from stale or partially initialized overlay memory.
-- `-z` only affects startup layout. If the video resolution changes later, restart the process so the OSD picks up the new size.
+- `-z` still controls the startup layout, but on SigmaStar builds `SIGHUP` can reload layout from `/etc/majestic.yaml` without killing the process.
+- Layout selection is now fit-based, not height-only: it picks the largest built-in font/layout profile that fits the current Majestic frame.
+- `1440x1080` stays on the HD font profile, while `1920x1080` can use the FHD profile.
+- Same-bucket and cross-bucket Majestic size changes are both applied live on `SIGHUP` without killing the process.
+- If the frame is smaller than the chosen overlay, the OSD falls back to top-left placement instead of using a negative offset.
+
+Example live layout reload:
+```sh
+kill -HUP "$(pidof msposd)"
+```
 
 ## Shutdown Behavior
 - On SigmaStar builds, shutdown intentionally skips explicit `MI_RGN_*` teardown calls.
 - Instead of calling `MI_RGN_DetachFromChn()`, `MI_RGN_Destroy()`, or `MI_RGN_DeInit()` during exit, the process waits briefly (`500 ms`) and exits.
 - This is deliberate: repeated restart testing showed that touching SigmaStar RGN teardown APIs during process exit made restart stability worse than leaving cleanup to the platform.
-- If your integration restarts `msposd` on resolution changes, this "do less on exit" behavior is the recommended path.
+- For live resolution/layout changes, the recommended path is now `SIGHUP` (in-process reload), not kill/restart.
+- If your integration still kills and restarts `msposd`, the SigmaStar process-exit bug can still be triggered by the platform driver on client disconnect.
+- During a Majestic reopen, SigmaStar can still emit brief `MI_RGN_IMPL_GetCanvasInfo ... Handle not found` warnings while the video pipeline is reinitializing; the current renderer keeps the process alive and recovers in place rather than crashing.
 - See [docs/sigmastar-rgn-restart-notes.md](./docs/sigmastar-rgn-restart-notes.md) for the serial error signatures, tested teardown variants, and the reasoning behind this behavior.

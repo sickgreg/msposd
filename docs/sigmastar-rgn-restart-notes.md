@@ -90,3 +90,148 @@ If your integration must restart `msposd` on resolution changes:
 - Prefer the no-teardown SigmaStar shutdown path.
 - Avoid adding explicit `MI_RGN_*` cleanup during exit unless the platform SDK behavior changes.
 - Treat the serial warnings above as known platform behavior around process exit / module reconnect, not necessarily a userspace rendering bug.
+
+## Later Findings
+
+Additional testing on the same platform narrowed the failure down further.
+
+### Single-port RGN works for live OSD
+
+- Attaching the OSD region only to VPE output port `0` still produced visible live OSD.
+- The second attach to VPE output port `1` does not appear to be required for the main live overlay path.
+- The likely tradeoff is that JPEG snapshot OSD may be lost, since port `1` appears to feed the JPEG path.
+
+### Explicit teardown still failed even with one port
+
+- Reverting to a clean one-port reverse-order teardown (`Detach -> Destroy -> DeInit`) still caused freezes and visible corruption.
+- In practice, switching from two-port teardown to one-port teardown did not make explicit shutdown safe enough.
+
+### The strongest failure signal is a kernel BUG on process exit
+
+Serial capture eventually showed that the most severe failure is not only user-space warnings. During `msposd` process exit, the kernel can BUG inside the SigmaStar driver stack:
+
+```text
+[MI_SYS_IMPL_MmaFree][7155]Case CamOsAtomicRead(&tmp->ref_cnt) != 0 BUG ON!!!
+...
+[<bfbe96f4>] (MI_SYS_IMPL_MmaFree [mi_sys])
+...
+[<bfc65971>] (_mi_rgn_drv_misys_buf_del [mi_rgn])
+...
+[<bfc62601>] (MI_RGN_IMPL_DeInit [mi_rgn])
+...
+[<bfc68483>] (mi_rgn_process_exit [mi_rgn])
+...
+[<bfbdc3cd>] (MI_DEVICE_Release [mi_common])
+...
+[<c0097b5b>] (__fput)
+...
+[<c001e471>] (do_exit)
+```
+
+This is the most important finding so far:
+
+- the failure can happen during file release on process exit
+- it is not limited to explicit `MI_RGN_DetachFromChn()` / `MI_RGN_Destroy()` calls from user space
+- the driver can still blow up while the `mi_rgn` device is being released automatically
+
+### Live `msposd` really holds the SigmaStar device nodes open
+
+On a clean running instance, `/proc/<pid>/fd` showed:
+
+- `3 -> /dev/mi_rgn`
+- `4 -> /dev/mi_sys`
+- `5 -> /dev/ttyS2`
+
+This confirms that the RGN and SYS drivers are tied to process lifetime through open device fds, not only through explicit API calls.
+
+### Timing-only exit tweaks did not solve it
+
+The following variants were tested and did not materially fix the repeated restart problem:
+
+- `500 ms` wait before exit
+- `2000 ms` wait before exit
+- immediate `_exit(0)` after the wait
+- skipping UART close in the signal path
+
+These tweaks changed the exact symptom timing, but repeated stop/start cycles still produced stuck `D` / `DW` state processes or driver faults.
+
+## Current Direction
+
+Because the kernel BUG is tied to `mi_rgn` device release during process exit, the stable direction is now:
+
+- avoid process exit for resolution-change handling
+- keep SigmaStar attached on one port only
+- use `SIGHUP` for an in-process layout reload
+
+This no longer uses the earlier soft-reexec experiment.
+
+### Current `SIGHUP` behavior
+
+`SIGHUP` now:
+
+- rereads `/etc/majestic.yaml`
+- extracts `video0.size`
+- picks the largest built-in layout that fits the new frame (`HD` vs `FHD`)
+- recomputes the OSD position from the new video size
+- updates the existing RGN display position in place
+- forces a redraw
+
+It does **not** kill the process, detach the region, or re-open `/dev/mi_rgn`.
+
+In the current implementation:
+
+- same-bucket changes are applied live
+- cross-bucket changes also switch live now by swapping to a second in-process region/font profile
+- if the frame is too small for the chosen overlay, the OSD falls back to top-left placement instead of using a negative offset
+
+### What was verified
+
+Repeated in-process `SIGHUP` reloads were tested on-target and remained stable:
+
+- PID stayed constant
+- `/proc/<pid>/fd` stayed stable (`/dev/mi_rgn`, `/dev/mi_sys`, `/dev/ttyS2`, epoll, pipe)
+- no extra `mi_rgn` / `mi_sys` fds accumulated
+- no `client ... disconnected` sequence appeared
+- no `MI_SYS_IMPL_MmaFree` kernel BUG was triggered
+
+This was tested both:
+
+- with repeated `SIGHUP` calls at the same configured size
+- while toggling `video0.size` in `/etc/majestic.yaml` between `1104x816` and `1472x816`
+
+Crossing into an `FHD`-class size was also tested:
+
+- `1440x1080` (HD fit) -> `1920x1080` (FHD fit) -> `1440x1080`
+
+This remained stable too:
+
+- same PID
+- stable fd table
+- no process exit
+- no `MI_SYS_IMPL_MmaFree` kernel BUG
+
+During the Majestic reopen window, SigmaStar can still emit brief transient warnings such as:
+
+```text
+MI_RGN_IMPL_GetCanvasInfo ... Handle not found
+```
+
+Those happen while the old canvas disappears before the new one is fully ready, but the current renderer stays alive and recovers in place.
+
+### What is no longer the recommended path
+
+The earlier in-place re-exec experiment (`SIGHUP` preserving `/dev/mi_rgn` and `/dev/mi_sys` across `exec`) is no longer the active direction.
+
+Why it was dropped:
+
+- the first re-exec could avoid the kernel BUG
+- but later re-execs either leaked extra `mi_*` fds or had to close them
+- once the older `mi_*` fds were closed on a later `exec`, the process fell back into the same `MI_DEVICE_Release` / `MI_SYS_IMPL_MmaFree` crash path
+- it also re-execed the same argv, so it did not naturally pick up a new runtime `-z` value
+
+So the current recommendation is:
+
+- use `SIGHUP` for live size/layout changes
+- avoid kill/restart for size changes on SigmaStar whenever possible
+
+See [agent-handover.md](./agent-handover.md) for the current live branch state and next-step testing notes.

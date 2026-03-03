@@ -19,6 +19,7 @@ unsigned long set_bitmapEx(int handle, BITMAP *bitmap, int BitsPerPixel);
 int unload_region(int *handle);
 void *get_directBMP(int handle);
 int InitRGN_SigmaStar();
+int set_region_visible(int handle, int x, int y, int visible);
 #ifdef __SIGMASTAR__
 int GetCanvas(int handle, MI_RGN_CanvasInfo_t *stCanvasInfo);
 uint32_t ST_OSD_DrawPoint(

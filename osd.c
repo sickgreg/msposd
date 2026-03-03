@@ -320,12 +320,28 @@ static const display_info_t fhd_display_info = {
 #define FULL_OVERLAY_ID 6
 #endif
 
+#if FULL_OVERLAY_ID > 0
+#define ALT_OVERLAY_ID (FULL_OVERLAY_ID - 1)
+#else
+#define ALT_OVERLAY_ID FULL_OVERLAY_ID
+#endif
+
 char font_2_name[256];
 uint16_t OVERLAY_WIDTH = 1800;
 uint16_t OVERLAY_HEIGHT = 1000;
 
 static displayport_vtable_t *display_driver;
 static display_info_t current_display_info = SD_DISPLAY_INFO;
+
+typedef enum {
+	FONT_BUCKET_HD = 0,
+	FONT_BUCKET_FHD = 1,
+} font_bucket_t;
+
+static font_bucket_t active_font_bucket = FONT_BUCKET_FHD;
+static int active_region_x = 0;
+static int active_region_y = 0;
+static int active_region_handle = FULL_OVERLAY_ID;
 
 /// @brief We keep the main font glyphs here
 BITMAP bitmapFnt;
@@ -338,6 +354,10 @@ int fcH = 8;
 char font_load_name[255];
 
 bool LoadFont();
+static font_bucket_t choose_font_bucket_for_size(int width, int height);
+static void apply_font_bucket(font_bucket_t bucket);
+static void compute_region_offsets(int width, int height, int overlay_width, int overlay_height,
+	int *x, int *y);
 
 static bool InjectChars(char *payload) {
 	char *str = payload + 4;
@@ -2618,6 +2638,72 @@ bool LoadFont() {
 		current_display_info.font_width, current_display_info.font_height,
 		current_display_info.char_width, current_display_info.char_height,
 		OVERLAY_WIDTH, OVERLAY_HEIGHT);
+	return true;
+}
+
+static int overlay_width_for_bucket(font_bucket_t bucket) {
+	display_info_t info = bucket == FONT_BUCKET_HD ? hd_display_info : fhd_display_info;
+	int char_width = matrix_size == 1 ? 50 : 53;
+	int overlay_width = info.font_width * char_width;
+
+	overlay_width = (overlay_width + 7) & ~7;
+	if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4)
+		overlay_width = (overlay_width + 15) & ~15;
+	return overlay_width;
+}
+
+static int overlay_height_for_bucket(font_bucket_t bucket) {
+	display_info_t info = bucket == FONT_BUCKET_HD ? hd_display_info : fhd_display_info;
+	int char_height = matrix_size == 1 ? 18 : 20;
+
+	return info.font_height * char_height;
+}
+
+static font_bucket_t choose_font_bucket_for_size(int width, int height) {
+	if (overlay_width_for_bucket(FONT_BUCKET_FHD) <= width &&
+		overlay_height_for_bucket(FONT_BUCKET_FHD) <= height)
+		return FONT_BUCKET_FHD;
+	return FONT_BUCKET_HD;
+}
+
+static void apply_font_bucket(font_bucket_t bucket) {
+	active_font_bucket = bucket;
+	if (bucket == FONT_BUCKET_HD) {
+		font_suffix = "_hd";
+		current_display_info = hd_display_info;
+	} else {
+		font_suffix = "";
+		current_display_info = fhd_display_info;
+	}
+
+	current_display_info.char_width = matrix_size == 1 ? 50 : 53;
+	current_display_info.char_height = matrix_size == 1 ? 18 : 20;
+	OVERLAY_WIDTH = overlay_width_for_bucket(bucket);
+	OVERLAY_HEIGHT = overlay_height_for_bucket(bucket);
+}
+
+static void compute_region_offsets(int width, int height, int overlay_width, int overlay_height,
+	int *x, int *y) {
+	int x_offs = 0;
+	int y_offs = 0;
+
+	if (width > overlay_width) {
+		x_offs = (width - overlay_width) / 2;
+		x_offs = (x_offs + 7) & ~7;
+	}
+
+	if (matrix_size == 8) {
+		y_offs = (height - overlay_height) / 2;
+		if (y_offs < 0)
+			y_offs = 0;
+	} else if (matrix_size == 9) {
+		y_offs = height - overlay_height;
+		if (y_offs < 0)
+			y_offs = 0;
+	}
+
+	*x = x_offs;
+	*y = y_offs;
 }
 
 static void InitMSPHook() {
@@ -2673,41 +2759,15 @@ static void InitMSPHook() {
 	printf("OSD is %ix%i pixels\n", OVERLAY_WIDTH, OVERLAY_HEIGHT);
 #endif
 
-	// Get video resolution
-	if (majestic_height < 1000 && majestic_height > 400) {
-		font_suffix = "_hd";
-		current_display_info = hd_display_info;
-	} else {
-		current_display_info = fhd_display_info;
-		font_suffix = "";
-	}
-
-	if (DrawOSD) {
-		LoadFont();
-	}
-
-	current_display_info.char_width = 53;
-	current_display_info.char_height = 20;
-	OVERLAY_WIDTH = current_display_info.font_width *
-					(current_display_info.char_width); // must be multiple of 8 !!!
-	OVERLAY_WIDTH = (OVERLAY_WIDTH + 7) & ~7;
+	apply_font_bucket(choose_font_bucket_for_size(majestic_width, majestic_height));
 	if (matrix_size == 11 && OVERLAY_WIDTH < (1920 - (53 * 2))) {
 		printf("Matrix size 11 not supported on resolutions smaller than 1920x1080p!\n");
 		matrix_size = 0;
+		apply_font_bucket(choose_font_bucket_for_size(majestic_width, majestic_height));
 	}
-	/*
-	On sigmastar the BMP row stride is aligned to 8 bytes, that is 16 pixels in
-	PIXEL_FORMAT_I4
-	*/
-	if (PIXEL_FORMAT_DEFAULT == PIXEL_FORMAT_I4)
-		OVERLAY_WIDTH = (OVERLAY_WIDTH + 15) & ~15; // for sigmastar I4 must be multiple of
-													// 16, since this is 8 bytes
 
 	if (DrawOSD)
-		OVERLAY_HEIGHT = current_display_info.font_height * (current_display_info.char_height);
-	// else
-	//     OVERLAY_HEIGHT =current_display_info.font_height*2;//We do not need
-	//     the whole screen, let's use only top part of the screen for drawing
+		LoadFont();
 
 	printf("Glyph size: %d:%d on a %d:%d matrix. Overlay: %dx%d\n",
 		current_display_info.font_width, current_display_info.font_height,
@@ -2735,22 +2795,17 @@ static void InitMSPHook() {
 	InitRGN_SigmaStar();
 #endif
 
-	int XOffs = (majestic_width - OVERLAY_WIDTH) / 2;
-	if (XOffs < 0)
-		XOffs = 8;
-	XOffs = (XOffs + 7) & ~7; // multiple of 8
-
+	int XOffs = 0;
 	int YOffs = 0;
-	if (matrix_size == 8)
-		YOffs = (majestic_height - OVERLAY_HEIGHT) / 2; // vertical center
+	compute_region_offsets(majestic_width, majestic_height, OVERLAY_WIDTH, OVERLAY_HEIGHT, &XOffs, &YOffs);
 
-	if (matrix_size == 9)
-		YOffs = (majestic_height - OVERLAY_HEIGHT); // vertical bottom
-
-	// THIS IS NEEDED, the main region to draw inside	
+	// THIS IS NEEDED, the main region to draw inside
 	if (DrawOSD)
 		rgn =
 			create_region(&osds[FULL_OVERLAY_ID].hand, XOffs, YOffs, OVERLAY_WIDTH, OVERLAY_HEIGHT);
+	active_region_handle = osds[FULL_OVERLAY_ID].hand;
+	active_region_x = XOffs;
+	active_region_y = YOffs;
 	if (verbose)
 		printf("Create_region PixelFormat:%d Size: %d:%d X_Offset:%d Y_Offset:%d results: %d\n",
 			PIXEL_FORMAT_DEFAULT, OVERLAY_WIDTH, OVERLAY_HEIGHT, XOffs, YOffs, rgn);
@@ -2895,6 +2950,91 @@ static void InitMSPHook() {
 
 	msp_state_t *msp_state = calloc(1, sizeof(msp_state_t));
 	msp_state->cb = &msp_callback;
+}
+
+int ReloadMajesticLayout(void) {
+#ifdef __SIGMASTAR__
+	font_bucket_t target_bucket;
+	int width = 0;
+	int height = 0;
+	int target_x = 0;
+	int target_y = 0;
+	int target_handle;
+	font_bucket_t previous_bucket;
+	int previous_width;
+	int previous_height;
+	bool bucket_changed;
+
+	if (!DrawOSD || osds == NULL)
+		return -1;
+
+	height = GetMajesticVideoConfig(&width);
+	if (width <= 0 || height <= 0)
+		return -1;
+
+	majestic_width = width;
+	majestic_height = height;
+	target_bucket = choose_font_bucket_for_size(width, height);
+	previous_bucket = active_font_bucket;
+	previous_width = OVERLAY_WIDTH;
+	previous_height = OVERLAY_HEIGHT;
+	bucket_changed = target_bucket != previous_bucket;
+
+	apply_font_bucket(target_bucket);
+	if (bucket_changed && !LoadFont()) {
+		apply_font_bucket(previous_bucket);
+		OVERLAY_WIDTH = previous_width;
+		OVERLAY_HEIGHT = previous_height;
+		return -1;
+	}
+	compute_region_offsets(width, height, OVERLAY_WIDTH, OVERLAY_HEIGHT, &target_x, &target_y);
+
+	target_handle = active_region_handle;
+	if (bucket_changed)
+		target_handle = active_region_handle == FULL_OVERLAY_ID ? ALT_OVERLAY_ID : FULL_OVERLAY_ID;
+
+	if (create_region(&target_handle, target_x, target_y, OVERLAY_WIDTH, OVERLAY_HEIGHT) != 0) {
+		apply_font_bucket(previous_bucket);
+		OVERLAY_WIDTH = previous_width;
+		OVERLAY_HEIGHT = previous_height;
+		if (bucket_changed)
+			LoadFont();
+		compute_region_offsets(width, height, OVERLAY_WIDTH, OVERLAY_HEIGHT, &target_x, &target_y);
+		if (create_region(&active_region_handle, target_x, target_y, OVERLAY_WIDTH, OVERLAY_HEIGHT) != 0)
+			return -1;
+		active_region_x = target_x;
+		active_region_y = target_y;
+		osds[FULL_OVERLAY_ID].hand = active_region_handle;
+		memset(rendered_character_map, 0xFF, sizeof(rendered_character_map));
+		osd_canvas_initialized = false;
+		bmpBuff.pData = NULL;
+		osds[FULL_OVERLAY_ID].updt = 1;
+		draw_screenBMP();
+		printf("Majestic layout fallback: kept %s bucket for %dx%d\n",
+			active_font_bucket == FONT_BUCKET_FHD ? "FHD" : "HD", width, height);
+		return 0;
+	}
+
+	if (target_handle != active_region_handle)
+		set_region_visible(active_region_handle, active_region_x, active_region_y, 0);
+	set_region_visible(target_handle, target_x, target_y, 1);
+
+	active_region_handle = target_handle;
+	active_region_x = target_x;
+	active_region_y = target_y;
+	osds[FULL_OVERLAY_ID].hand = active_region_handle;
+	memset(rendered_character_map, 0xFF, sizeof(rendered_character_map));
+	osd_canvas_initialized = false;
+	LastFullCanvasRefresh = 0;
+	bmpBuff.pData = NULL;
+	osds[FULL_OVERLAY_ID].updt = 1;
+	draw_screenBMP();
+	printf("Majestic layout reloaded for %dx%d using %s bucket\n",
+		width, height, active_font_bucket == FONT_BUCKET_FHD ? "FHD" : "HD");
+	return 0;
+#else
+	return -1;
+#endif
 }
 
 static void CloseMSP() {

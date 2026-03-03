@@ -1,0 +1,301 @@
+SigmaStar RGN Bug Reference
+===========================
+
+Scope
+-----
+
+This note summarizes the observed SigmaStar RGN/SYS failure mode on Star6E-class
+targets while running msposd2/msposd as a local OSD renderer.
+
+The "RGN bug" refers to the fact that process exit or RGN client teardown can
+trigger driver-side faults inside the SigmaStar media stack, especially around
+/dev/mi_rgn and /dev/mi_sys release.
+
+
+What the bug looks like
+-----------------------
+
+Typical serial-console sequence during bad shutdown/restart:
+
+  client [pid] disconnected, module:sys
+  client [pid] disconnected, module:rgn
+  Apps need check buffer clear flow. Driver clear window handler buffer ...
+  MI_SYS_IMPL_MmaFree[7163]: find_allocation_by_pa fail phyAddr=...
+  Apps need check buffer clear flow. Driver clear region handler 9.
+
+Then, after the process or pipeline comes back:
+
+  client [newpid] connected, module:rgn
+  MI_RGN_IMPL_GetAttr[1318] Handle not found.
+  MI_RGN_IMPL_GetDisplayAttr[1819] pstChnPort and handle not matched.
+  MI_RGN_IMPL_DetachFromChn[1696] pstChnPort and handle not matched.
+  client [newpid] connected, module:sys
+
+Earlier/worse failure mode:
+
+  _MI_SYS_MMU_Callback ... Status=0x2 ... IsWrite=0
+
+That MMU callback flood appears to be stale read access during video pipeline
+reconfiguration and was the worst visible runtime symptom before the later
+kernel BUG was captured.
+
+
+The strongest failure signal
+---------------------------
+
+The most important finding is that the problem is not only a user-space warning
+pattern. The kernel can BUG during process exit while releasing the SigmaStar
+devices:
+
+  [MI_SYS_IMPL_MmaFree][7155]Case CamOsAtomicRead(&tmp->ref_cnt) != 0 BUG ON!!!
+  ...
+  MI_SYS_IMPL_MmaFree
+  MI_SYS_IMPL_PrivateDevChnHeapFree
+  mi_sys_PrivateDevChnHeapFree
+  _mi_rgn_drv_misys_buf_del
+  MI_RGN_IMPL_DeInit
+  mi_rgn_process_exit
+  MI_DEVICE_Release
+  __fput
+  do_exit
+
+Meaning:
+
+1. The crash can be triggered by process exit itself.
+2. It is not limited to explicit MI_RGN_DetachFromChn / MI_RGN_Destroy calls.
+3. The driver can fail while /dev/mi_rgn is being released automatically.
+
+
+What ties the bug to process lifetime
+-------------------------------------
+
+On a clean running msposd instance, /proc/<pid>/fd showed:
+
+  3 -> /dev/mi_rgn
+  4 -> /dev/mi_sys
+  5 -> /dev/ttyS2
+
+So the media stack is tied directly to process lifetime through open device fds.
+When the process dies, the kernel releases those fds and enters the SigmaStar
+driver cleanup path even if user space tries to "do nothing."
+
+
+What was tested
+---------------
+
+The following shutdown/restart strategies were tested:
+
+1. Explicit teardown:
+   - MI_RGN_DetachFromChn()
+   - MI_RGN_Destroy()
+   - MI_RGN_DeInit()
+
+2. Staged teardown:
+   - short delay before detach
+   - delay before destroy
+
+3. Hide-first attempts:
+   - using MI_RGN_AttachToChn() as a fake hide (bad)
+   - using real MI_RGN_SetDisplayAttr() to hide
+
+4. Partial teardown:
+   - detach only
+   - skip destroy
+   - skip deinit
+
+5. No explicit teardown:
+   - no MI_RGN_* calls
+   - short sleep
+   - let process exit
+
+6. One-port vs two-port attach:
+   - original code attached the same region to VPE port 0 and port 1
+   - later tests reduced that to port 0 only
+
+7. Soft-reexec experiment:
+   - SIGHUP preserved /dev/mi_rgn and /dev/mi_sys across exec
+   - attempted to avoid process-exit release
+
+8. Final current path:
+   - SIGHUP performs in-process Majestic layout reload only
+   - no process exit
+   - no exec
+
+
+What did NOT help
+-----------------
+
+Explicit teardown was consistently unsafe:
+
+- Detach -> Destroy -> DeInit still caused freezes, garbled pixels, or driver
+  cleanup errors.
+- One-port teardown was cleaner than two-port teardown, but still not safe
+  enough.
+
+Hide-first was not the answer:
+
+- Reusing MI_RGN_AttachToChn() as a fake hide caused:
+    MI_RGN_IMPL_AttachToChn ... Channel port had been attached.
+- Using real MI_RGN_SetDisplayAttr() to hide before exit did not materially fix
+  the disconnect/reconnect errors.
+
+Timing-only tweaks did not solve the underlying issue:
+
+- 500 ms sleep before exit
+- 2000 ms sleep before exit
+- immediate _exit(0)
+- skipping UART close in the signal path
+
+These changed timing but did not prevent the driver bug on real process exit.
+
+Transparent final frame flush did not fix it either:
+
+- clearing the canvas to transparent
+- calling MI_RGN_UpdateCanvas()
+- then sleeping before exit
+
+This did not stop the same MI_SYS_IMPL_MmaFree / MI_DEVICE_Release BUG.
+
+Soft-reexec was only partially successful:
+
+- the first reexec could avoid the old bug
+- later reexecs either leaked extra mi_rgn/mi_sys fds or had to close them
+- once old preserved fds were closed on a later cycle, the process fell back
+  into the same kernel crash path
+- it also did not solve the real "live resolution changed" problem cleanly
+
+Conclusion: soft-reexec was a useful diagnostic step, but not the final answer.
+
+
+What DID help
+-------------
+
+1. Single-port attach
+
+Attaching only to VPE output port 0 simplified the lifecycle and removed the
+worst two-port state mismatches. Live OSD still worked on the main video path.
+
+2. Avoiding process exit for resolution/layout updates
+
+This is the key practical breakthrough.
+
+Instead of killing and restarting msposd, SIGHUP now:
+
+- rereads /etc/majestic.yaml
+- extracts video0.size
+- recomputes region placement
+- updates the existing RGN display position in place
+- forces a redraw
+
+It does NOT:
+
+- exit the process
+- detach the region
+- destroy the region
+- close and reopen /dev/mi_rgn
+
+That avoids the SigmaStar process-exit release path entirely.
+
+
+Current stable behavior
+-----------------------
+
+Current stable path:
+
+  kill -HUP "$(pidof msposd)"
+
+Observed results on target:
+
+- PID stays the same
+- /proc/<pid>/fd stays stable
+- no extra /dev/mi_rgn or /dev/mi_sys fds appear
+- no client disconnected sequence
+- no MI_SYS_IMPL_MmaFree kernel BUG
+
+This was tested with:
+
+1. repeated plain HUPs
+2. repeated live changes of /etc/majestic.yaml video0.size between:
+   - 1104x816
+   - 1472x816
+3. repeated live bucket switches between:
+   - 1440x1080 (HD fit)
+   - 1920x1080 (FHD fit)
+
+Both stayed stable.
+
+
+Current limitation
+------------------
+
+The current in-process reload safely handles same-bucket layout changes.
+
+"Bucket" here means the existing font/layout choice:
+
+- HD bucket: heights below the current FHD threshold
+- FHD bucket: larger layouts using the larger font set
+
+At the moment:
+
+- same-bucket changes are applied live
+- cross-bucket changes also switch live in-process by swapping to the matching
+  preloaded layout/region
+
+The remaining rough edge is transient:
+
+- during Majestic reopen, SigmaStar can still log brief
+  MI_RGN_IMPL_GetCanvasInfo ... Handle not found
+  warnings while the old canvas disappears before the new one is fully ready
+
+
+What is still unsafe
+--------------------
+
+Real process exit is still unsafe on SigmaStar.
+
+That means these remain risky:
+
+- kill msposd
+- init-script restart using TERM/stop_service
+- any integration path that fully stops the process for a resolution change
+
+If the process exits, the SigmaStar kernel can still hit the same device-release
+BUG regardless of what user-space teardown code runs first.
+
+
+Operational recommendation
+--------------------------
+
+For SigmaStar:
+
+1. Do not use kill/restart for normal resolution changes.
+2. Use SIGHUP to trigger in-process layout reload.
+3. Keep the single-port attach model.
+4. Keep explicit MI_RGN_* teardown out of the normal exit path.
+
+If a service layer currently restarts msposd when the user changes resolution,
+that service layer should be changed to:
+
+  kill -HUP "$(pidof msposd)"
+
+instead of stopping and restarting the process.
+
+
+Best current interpretation
+---------------------------
+
+The "RGN bug" is fundamentally a SigmaStar driver/process-lifetime bug, not just
+a renderer bug.
+
+Specifically:
+
+- the media driver can fail when the RGN/SYS client fds are released on process
+  exit
+- explicit user-space teardown often makes the timing worse, not better
+- the most reliable workaround is to avoid process exit for normal reconfiguration
+
+So the safest design is:
+
+- keep the process alive
+- update layout in place
+- treat process death as a last-resort path, not the normal control flow

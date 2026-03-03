@@ -30,6 +30,7 @@
 bool vtxMenuActive = false;
 bool armed = true;
 bool AbortNow = false;
+bool layout_reload_pending = false;
 bool verbose = false;
 bool ParseMSP = true;
 bool DrawOSD = true;
@@ -70,6 +71,9 @@ struct sockaddr_in sin_out = {
 int out_sock = 0;
 int last_board_temp = -100;
 static int shutdown_exit_code = EXIT_SUCCESS;
+static uint64_t next_layout_reload_ms = 0;
+
+#define LAYOUT_RELOAD_DELAY_MS 1500
 
 // Include the renderer implementation directly, same as msposd.
 #include "osd.c"
@@ -179,6 +183,29 @@ static void signal_cb(evutil_socket_t fd, short event, void *arg) {
 	}
 
 	event_base_loopbreak(event_base);
+}
+
+static void restart_cb(evutil_socket_t fd, short event, void *arg) {
+	(void)fd;
+	(void)event;
+	(void)arg;
+
+	if (AbortNow)
+		return;
+
+	layout_reload_pending = true;
+	next_layout_reload_ms = now_ms() + LAYOUT_RELOAD_DELAY_MS;
+	fprintf(stderr, "Reload request: SIGHUP scheduled\n");
+}
+
+static void process_pending_layout_reload(void) {
+	if (!layout_reload_pending)
+		return;
+	if (now_ms() < next_layout_reload_ms)
+		return;
+
+	layout_reload_pending = false;
+	ReloadMajesticLayout();
 }
 
 int SendWfbLogToGround(void) {
@@ -443,6 +470,7 @@ static void poll_msp(evutil_socket_t sock, short event, void *arg) {
 	if (matrix_size == 99)
 		draw_screenBMP();
 
+	process_pending_layout_reload();
 	send_variant_request2(fd);
 }
 
@@ -465,7 +493,9 @@ static int handle_data(const char *port_name, int baudrate) {
 	int ret = EXIT_SUCCESS;
 
 	AbortNow = false;
+	layout_reload_pending = false;
 	shutdown_exit_code = EXIT_SUCCESS;
+	next_layout_reload_ms = 0;
 
 	if (validate_master_path(port_name) != 0) {
 		fprintf(stderr, "Local renderer mode requires a serial device path, got: %s\n", port_name);
@@ -517,7 +547,7 @@ static int handle_data(const char *port_name, int baudrate) {
 	sig_term = evsignal_new(base, SIGTERM, signal_cb, base);
 	event_add(sig_term, NULL);
 
-	sig_hup = evsignal_new(base, SIGHUP, signal_cb, base);
+	sig_hup = evsignal_new(base, SIGHUP, restart_cb, base);
 	event_add(sig_hup, NULL);
 
 	sig_quit = evsignal_new(base, SIGQUIT, signal_cb, base);

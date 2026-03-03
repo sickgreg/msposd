@@ -13,6 +13,8 @@
 #ifdef __SIGMASTAR__
 int PIXEL_FORMAT_DEFAULT = E_MI_RGN_PIXEL_FORMAT_I4; // 0 for PIXEL_FORMAT_1555 , 4 for
 													 // E_MI_RGN_PIXEL_FORMAT_I8
+MI_S32 MI_RGN_SetDisplayAttr(SOC MI_RGN_HANDLE hHandle, MI_RGN_ChnPort_t *pstChnPort,
+	MI_RGN_ChnPortParam_t *pstChnPortAttr);
 #else
 int PIXEL_FORMAT_DEFAULT = 3; // 0 for PIXEL_FORMAT_1555 , 4 for E_MI_RGN_PIXEL_FORMAT_I8
 #endif
@@ -73,6 +75,7 @@ int InitRGN_SigmaStar(){
 
 int create_region(int *handle, int x, int y, int width, int height) {
 	int s32Ret = -1;
+	int need_attach = 1;
 #if !defined(_x86) && !defined(__ROCKCHIP__)
 #ifdef __SIGMASTAR__
 	MI_RGN_ChnPort_t stChn;
@@ -82,6 +85,11 @@ int create_region(int *handle, int x, int y, int width, int height) {
 
 	MI_RGN_ChnPortParam_t stChnAttr;
 	MI_RGN_ChnPortParam_t stChnAttrCurrent;
+	memset(&stChn, 0, sizeof(stChn));
+	memset(&stRegionCurrent, 0, sizeof(stRegionCurrent));
+	memset(&stRegion, 0, sizeof(stRegion));
+	memset(&stChnAttr, 0, sizeof(stChnAttr));
+	memset(&stChnAttrCurrent, 0, sizeof(stChnAttrCurrent));
 
 #if __INFINITY6C__	
 	stChn.s32DevId = 0;
@@ -116,6 +124,11 @@ int create_region(int *handle, int x, int y, int width, int height) {
 
 	RGN_CHN_ATTR_S stChnAttr;
 	RGN_CHN_ATTR_S stChnAttrCurrent;
+	memset(&stChn, 0, sizeof(stChn));
+	memset(&stRegionCurrent, 0, sizeof(stRegionCurrent));
+	memset(&stRegion, 0, sizeof(stRegion));
+	memset(&stChnAttr, 0, sizeof(stChnAttr));
+	memset(&stChnAttrCurrent, 0, sizeof(stChnAttrCurrent));
 
 	stChn.enModId = HI_ID_VENC;
 	stChn.s32DevId = 0;
@@ -179,28 +192,40 @@ int create_region(int *handle, int x, int y, int width, int height) {
 #else
 	s32Ret = HI_MPI_RGN_GetDisplayAttr(*handle, &stChn, &stChnAttrCurrent);
 #endif
-	if (s32Ret)
+	if (s32Ret) {
 		if (verbose)
 			fprintf(stderr, "[%s:%d]RGN_GetDisplayAttr failed with %#x %d, attaching...\n",
 				__func__, __LINE__, s32Ret, *handle);
+		need_attach = 1;
+	}
 #ifdef __SIGMASTAR__
-		else if (stChnAttrCurrent.stPoint.u32X != x || stChnAttrCurrent.stPoint.u32Y != y)
+	else if (stChnAttrCurrent.stPoint.u32X != x || stChnAttrCurrent.stPoint.u32Y != y)
 #else
-		else if (stChnAttrCurrent.unChnAttr.stOverlayChn.stPoint.s32X != x ||
-				 stChnAttrCurrent.unChnAttr.stOverlayChn.stPoint.s32Y != y)
+	else if (stChnAttrCurrent.unChnAttr.stOverlayChn.stPoint.s32X != x ||
+			 stChnAttrCurrent.unChnAttr.stOverlayChn.stPoint.s32Y != y)
 #endif
-		{
-			if (verbose)
-				fprintf(stderr,
-					"[%s:%d] Position has changed, detaching handle %d from "
-					"channel %d...\n",
-					__func__, __LINE__, *handle, &stChn.s32ChnId);
+	{
+		if (verbose)
+			fprintf(stderr, "[%s:%d] Position has changed, updating handle %d...\n",
+				__func__, __LINE__, *handle);
 #ifdef __SIGMASTAR__
+		stChnAttrCurrent.stPoint.u32X = x;
+		stChnAttrCurrent.stPoint.u32Y = y;
+		stChnAttrCurrent.bShow = 1;
+		s32Ret = MI_RGN_SetDisplayAttr(DEV *handle, &stChn, &stChnAttrCurrent);
+		if (s32Ret == MI_SUCCESS)
+			need_attach = 0;
+		else {
 			MI_RGN_DetachFromChn(DEV *handle, &stChn);
-#else
-			HI_MPI_RGN_DetachFromChn(*handle, &stChn);
-#endif
+			need_attach = 1;
 		}
+#else
+		HI_MPI_RGN_DetachFromChn(*handle, &stChn);
+		need_attach = 1;
+#endif
+	} else {
+		need_attach = 0;
+	}
 
 #ifdef __SIGMASTAR__
 	memset(&stChnAttr, 0, sizeof(MI_RGN_ChnPortParam_t));
@@ -228,14 +253,8 @@ int create_region(int *handle, int x, int y, int width, int height) {
 #else
 	stChn.s32OutputPortId = 0;
 #endif
-	s32Ret = MI_RGN_AttachToChn(DEV *handle, &stChn, &stChnAttr);
-#if __INFINITY6C__
-	stChn.s32ChnId = 1;
-	stChn.s32OutputPortId = 1;
-#else
-	stChn.s32OutputPortId = 1;
-#endif
-	s32Ret = MI_RGN_AttachToChn(DEV *handle, &stChn, &stChnAttr);
+	if (need_attach)
+		s32Ret = MI_RGN_AttachToChn(DEV *handle, &stChn, &stChnAttr);
 #else
 	memset(&stChnAttr, 0, sizeof(RGN_CHN_ATTR_S));
 	stChnAttr.bShow = 1;
@@ -518,6 +537,42 @@ int unload_region(int *handle) {
 			*handle);
 #endif
 	return s32Ret;
+}
+
+int set_region_visible(int handle, int x, int y, int visible) {
+#ifdef __SIGMASTAR__
+	MI_RGN_ChnPort_t stChn;
+	MI_RGN_ChnPortParam_t stChnAttr;
+	int s32Ret;
+
+	memset(&stChn, 0, sizeof(stChn));
+#if __INFINITY6C__
+	stChn.s32DevId = 0;
+	stChn.s32ChnId = 0;
+	stChn.eModId = 34;
+#else
+	stChn.eModId = E_MI_RGN_MODID_VPE;
+	stChn.s32DevId = 0;
+	stChn.s32ChnId = 0;
+#endif
+	stChn.s32OutputPortId = 0;
+
+	memset(&stChnAttr, 0, sizeof(stChnAttr));
+	s32Ret = MI_RGN_GetDisplayAttr(DEV handle, &stChn, &stChnAttr);
+	if (s32Ret)
+		return s32Ret;
+
+	stChnAttr.stPoint.u32X = x;
+	stChnAttr.stPoint.u32Y = y;
+	stChnAttr.bShow = visible ? 1 : 0;
+	return MI_RGN_SetDisplayAttr(DEV handle, &stChn, &stChnAttr);
+#else
+	(void)handle;
+	(void)x;
+	(void)y;
+	(void)visible;
+	return 0;
+#endif
 }
 #ifdef __SIGMASTAR__
 
