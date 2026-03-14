@@ -71,10 +71,10 @@ UART mode note:
 - Main OSD rendering uses incremental redraws when possible instead of rebuilding the entire canvas every frame.
 - `MSPOSD.msg` updates are throttled separately from the main render rate and only rerasterize on content changes or dynamic token refreshes.
 - The direct SigmaStar canvas path performs a periodic full-canvas resync every 3 seconds to recover from stale or partially initialized overlay memory.
-- `-z` still controls the startup layout, but on SigmaStar builds `SIGHUP` can reload layout from `/etc/majestic.yaml` without killing the process.
-- Layout selection is now fit-based, not height-only: it picks the largest built-in font/layout profile that fits the current Majestic frame.
+- `-z` still controls the startup layout, but on SigmaStar builds `SIGHUP` can reload layout from live `/proc/mi_modules/...` video state without killing the process.
+- Layout selection is now fit-based, not height-only: it picks the largest built-in font/layout profile that fits the current live video frame.
 - `1440x1080` stays on the HD font profile, while `1920x1080` can use the FHD profile.
-- Same-bucket and cross-bucket Majestic size changes are both applied live on `SIGHUP` without killing the process.
+- Same-bucket and cross-bucket live size changes are both applied on `SIGHUP` without killing the process.
 - If the frame is smaller than the chosen overlay, the OSD falls back to top-left placement instead of using a negative offset.
 
 Example live layout reload:

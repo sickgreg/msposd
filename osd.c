@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <libgen.h> // For dirname()
 #include <math.h>
@@ -2467,13 +2468,141 @@ unsigned char *loadPngToBMP(const char *filename, unsigned int *width, unsigned 
 	return bmpData;
 }
 
-int GetMajesticVideoConfig(int *Width) {
+static bool parse_resolution_token(const char *line, int *width, int *height) {
+	const char *ptr = line;
+
+	while (ptr != NULL && *ptr != '\0') {
+		if (isdigit((unsigned char)*ptr)) {
+			int parsed_width = 0;
+			int parsed_height = 0;
+			int matched = 0;
+
+			if (sscanf(ptr, "%dx%d%n", &parsed_width, &parsed_height, &matched) == 2 &&
+				matched > 0 && parsed_width > 0 && parsed_height > 0) {
+				*width = parsed_width;
+				*height = parsed_height;
+				return true;
+			}
+		}
+		ptr++;
+	}
+
+	return false;
+}
+
+static int parse_int_fields(const char *line, int *values, int max_values) {
+	int count = 0;
+	const char *ptr = line;
+
+	while (count < max_values && ptr != NULL && *ptr != '\0') {
+		char *endptr = NULL;
+		long value;
+
+		while (*ptr != '\0' && !isdigit((unsigned char)*ptr) && *ptr != '-') {
+			ptr++;
+		}
+		if (*ptr == '\0')
+			break;
+
+		value = strtol(ptr, &endptr, 10);
+		if (endptr == ptr)
+			break;
+
+		values[count++] = (int)value;
+		ptr = endptr;
+	}
+
+	return count;
+}
+
+static bool read_venc_procfs_video_config(const char *path, int *width, int *height) {
+	FILE *file = fopen(path, "r");
+	char line[512];
+
+	if (file == NULL)
+		return false;
+
+	while (fgets(line, sizeof(line), file)) {
+		if (strstr(line, "ContentWidth") != NULL && strstr(line, "ContentHeight") != NULL) {
+			int values[8];
+
+			if (fgets(line, sizeof(line), file) != NULL && parse_int_fields(line, values, 8) >= 5 &&
+				values[3] > 0 && values[4] > 0) {
+				*width = values[3];
+				*height = values[4];
+				fclose(file);
+				return true;
+			}
+		}
+
+		if (strstr(line, "ChnId  Width  Height") != NULL) {
+			int values[8];
+
+			if (fgets(line, sizeof(line), file) != NULL && parse_int_fields(line, values, 8) >= 3 &&
+				values[1] > 0 && values[2] > 0) {
+				*width = values[1];
+				*height = values[2];
+				fclose(file);
+				return true;
+			}
+		}
+	}
+
+	fclose(file);
+	return false;
+}
+
+static bool read_vpe_procfs_video_config(const char *path, int *width, int *height) {
+	FILE *file = fopen(path, "r");
+	char line[512];
+
+	if (file == NULL)
+		return false;
+
+	while (fgets(line, sizeof(line), file)) {
+		if (strstr(line, "MaxWH") != NULL) {
+			if (fgets(line, sizeof(line), file) != NULL && parse_resolution_token(line, width, height)) {
+				fclose(file);
+				return true;
+			}
+		}
+
+		if (strstr(line, "InSize") != NULL && strstr(line, "SclInSize") != NULL) {
+			if (fgets(line, sizeof(line), file) != NULL && parse_resolution_token(line, width, height)) {
+				fclose(file);
+				return true;
+			}
+		}
+	}
+
+	fclose(file);
+	return false;
+}
+
+static bool get_live_procfs_video_config(int *width, int *height) {
+#ifdef __SIGMASTAR__
+	if (read_venc_procfs_video_config("/proc/mi_modules/mi_venc/mi_venc0", width, height)) {
+		printf("Live procfs video size:%d,%d from mi_venc0\n", *width, *height);
+		return true;
+	}
+
+	if (read_vpe_procfs_video_config("/proc/mi_modules/mi_vpe/mi_vpe0", width, height)) {
+		printf("Live procfs video size:%d,%d from mi_vpe0\n", *width, *height);
+		return true;
+	}
+#endif
+
+	return false;
+}
+
+static int GetMajesticVideoConfigFromFile(int *Width) {
 
 	FILE *file;
 	char line[256];
 	bool inVideo0Section = false;
-	char sizeValue[50]; // Buffer to store the size value
-	int width, height;
+	char sizeValue[50] = ""; // Buffer to store the size value
+	int width = 1280;
+	int height = 720;
 
 	// Open the configuration file
 #ifdef _x86
@@ -2483,6 +2612,7 @@ int GetMajesticVideoConfig(int *Width) {
 #endif
 	if (file == NULL) {
 		printf("Could not open majestic.yaml.\n");
+		*Width = 0;
 		return 0;
 	}
 
@@ -2535,8 +2665,30 @@ int GetMajesticVideoConfig(int *Width) {
 
 	} else {
 		printf("Size parameter not found in Video0 section.\n");
+		*Width = 1280;
+		height = 720;
 	}
 	return height;
+}
+
+static int GetVideoConfig(int *Width) {
+	int width = 0;
+	int height = 0;
+
+	if (get_live_procfs_video_config(&width, &height)) {
+		*Width = width;
+		return height;
+	}
+
+	height = GetMajesticVideoConfigFromFile(&width);
+	if (height > 0) {
+		*Width = width;
+		return height;
+	}
+
+	printf("Failed to read live video size, defaulting to 1280x720\n");
+	*Width = 1280;
+	return 720;
 }
 
 void getExecutablePath(char *buffer, size_t bufferSize) {
@@ -2748,7 +2900,7 @@ static void InitMSPHook() {
 #endif
 
 	if (!majestic_width && !majestic_height) {
-		majestic_height = GetMajesticVideoConfig(&majestic_width);
+		majestic_height = GetVideoConfig(&majestic_width);
 	}
 
 #if defined(_x86) || defined(__ROCKCHIP__)
@@ -2968,7 +3120,7 @@ int ReloadMajesticLayout(void) {
 	if (!DrawOSD || osds == NULL)
 		return -1;
 
-	height = GetMajesticVideoConfig(&width);
+	height = GetVideoConfig(&width);
 	if (width <= 0 || height <= 0)
 		return -1;
 
